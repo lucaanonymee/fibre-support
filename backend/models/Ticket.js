@@ -16,6 +16,12 @@ const ticketSchema = new mongoose.Schema({
     required: true
   },
 
+  // 🔹 Description optionnelle du problème
+  description: {
+    type: String,
+    default: null
+  },
+
   statut: {
     type: String,
     enum: ["OUVERT", "EN_COURS", "CLOTURE"],

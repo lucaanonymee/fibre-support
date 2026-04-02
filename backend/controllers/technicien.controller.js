@@ -1,4 +1,5 @@
 const Ticket = require("../models/Ticket");
+const { envoyerEmailClotureTicket } = require("../config/email");
 
 // Voir tickets assignés à un technicien
 exports.ticketsAssignes = async (req, res) => {
@@ -62,6 +63,16 @@ exports.mettreAJourTicket = async (req, res) => {
       ticket.statut = "CLOTURE";
       ticket.clotureDate = new Date();
       await ticket.save();
+
+      // 🔹 Envoyer un email de notification au client
+      try {
+        if (ticket.clientId && ticket.clientId.email) {
+          await envoyerEmailClotureTicket(ticket.clientId.email, ticket);
+        }
+      } catch (emailErr) {
+        console.error("Erreur envoi email clôture:", emailErr.message);
+        // Ne pas bloquer la clôture si l'email échoue
+      }
       
       return res.json({
         message: "Ticket clôturé avec succès",

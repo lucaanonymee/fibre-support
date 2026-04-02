@@ -11,7 +11,7 @@ const validateSN = (sn) => {
 // 🔹 Créer un ticket + assigner automatiquement un admin selon localisation
 exports.creerTicket = async (req, res) => {
   try {
-    const { sn, typeProbleme, localisation } = req.body;
+    const { sn, typeProbleme, localisation, description } = req.body;
     const clientId = req.user.id;
 
     // 🔹 Vérifier que tous les champs sont fournis
@@ -48,19 +48,52 @@ exports.creerTicket = async (req, res) => {
       });
     }
 
-    // 🔹 Si plusieurs admins → choisir celui avec le moins de tickets OUVERT
-    let adminSelectionne = admins[0];
-    let minTickets = Infinity;
+    // 🔹 Si plusieurs admins → choisir celui avec le moins de tickets (OUVERT + EN_COURS)
+    // En cas d'égalité sur la somme, choisir celui avec le moins de tickets OUVERT.
+    const adminIds = admins.map((admin) => admin._id);
 
-    for (let admin of admins) {
-      const nbTickets = await Ticket.countDocuments({
-        adminId: admin._id,
-        statut: "OUVERT"
+    const chargesAdmins = await Ticket.aggregate([
+      {
+        $match: {
+          adminId: { $in: adminIds },
+          statut: { $in: ["OUVERT", "EN_COURS"] }
+        }
+      },
+      {
+        $group: {
+          _id: "$adminId",
+          total: { $sum: 1 },
+          ouverts: {
+            $sum: {
+              $cond: [{ $eq: ["$statut", "OUVERT"] }, 1, 0]
+            }
+          }
+        }
+      }
+    ]);
+
+    const chargeParAdmin = new Map();
+    for (const charge of chargesAdmins) {
+      chargeParAdmin.set(charge._id.toString(), {
+        total: charge.total,
+        ouverts: charge.ouverts
       });
+    }
 
-      if (nbTickets < minTickets) {
-        minTickets = nbTickets;
+    let adminSelectionne = admins[0];
+    let meilleurTotal = Infinity;
+    let meilleurOuverts = Infinity;
+
+    for (const admin of admins) {
+      const charge = chargeParAdmin.get(admin._id.toString()) || { total: 0, ouverts: 0 };
+
+      const estMeilleurTotal = charge.total < meilleurTotal;
+      const egaliteTotalMaisMoinsOuverts = charge.total === meilleurTotal && charge.ouverts < meilleurOuverts;
+
+      if (estMeilleurTotal || egaliteTotalMaisMoinsOuverts) {
         adminSelectionne = admin;
+        meilleurTotal = charge.total;
+        meilleurOuverts = charge.ouverts;
       }
     }
 
@@ -68,6 +101,7 @@ exports.creerTicket = async (req, res) => {
     const ticket = await Ticket.create({
       sn,
       typeProbleme,
+      description: description || null,
       localisation,
       clientId,
       adminId: adminSelectionne._id

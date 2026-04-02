@@ -60,6 +60,7 @@ const utilisateurSchema = new mongoose.Schema({
   // 🔹 Numéro de téléphone (obligatoire pour CLIENT)
   numTelephone: {
     type: String,
+    trim: true,
     required: function() { return this.role === "CLIENT"; }
   },
 
@@ -100,19 +101,41 @@ const utilisateurSchema = new mongoose.Schema({
   isActive: {
     type: Boolean,
     default: true
+  },
+
+  // 🔹 Refresh Token (OAuth 2.0)
+  refreshToken: {
+    type: String,
+    default: null
   }
 
 }, { timestamps: true });
 
+
+// Le numéro de téléphone est réservé au rôle CLIENT.
+utilisateurSchema.pre("validate", function(next) {
+  if (this.role !== "CLIENT") {
+    this.numTelephone = undefined;
+  }
+  next();
+});
+// 🔹 Supprimer zoneIntervention pour les clients (un client peut avoir plusieurs SN dans différentes zones)
+utilisateurSchema.pre("save", function(next) {
+  if (this.role === "CLIENT") {
+    this.zoneIntervention = undefined;
+  }
+
+  next();
+});
+
 // Créer le model
-utilisateurSchema.pre("save", async function(next) {
+utilisateurSchema.pre("save", async function() {
   if (!this.isModified("motDePasse")) {
-    return next();
+    return;
   }
 
   const salt = await bcrypt.genSalt(10);
   this.motDePasse = await bcrypt.hash(this.motDePasse, salt);
-  next();
 });
 
 const Utilisateur = mongoose.model("Utilisateur", utilisateurSchema);

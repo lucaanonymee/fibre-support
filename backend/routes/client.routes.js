@@ -1,11 +1,12 @@
 const router = require("express").Router();
 const client = require("../controllers/client.controller");
-const { authenticateToken, authorizeRoles } = require("../middlewares/auth.middleware");
+const { authenticateToken } = require("../middlewares/auth.middleware");
+const { authorizeRoles } = require("../middlewares/role.middleware");
 
-router.use(authenticateToken, authorizeRoles("CLIENT"));
+const auth = [authenticateToken, authorizeRoles("CLIENT")];
 
-router.post("/api/client/ticket", client.creerTicket);
-router.get("/api/client/tickets", client.consulterTicketsClient);
+router.post("/api/client/ticket", auth, client.creerTicket);
+router.get("/api/client/tickets", auth, client.consulterTicketsClient);
 
 
 module.exports = router;

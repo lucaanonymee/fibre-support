@@ -1,4 +1,5 @@
 const Utilisateur = require("../models/Utilisateur");
+const { envoyerEmailBienvenueCompte } = require("../config/email");
 
 // 🔹 Fonction de validation mot de passe
 const validatePassword = (motDePasse) => {
@@ -80,6 +81,18 @@ exports.creerAdmin = async (req, res) => {
       emailVerifie: true // Admin créé par Super Admin → email vérifié automatiquement
     });
 
+    // 🔹 Envoyer l'email de bienvenue avec identifiants temporaires
+    try {
+      await envoyerEmailBienvenueCompte({
+        email: emailNormalise,
+        nom,
+        role: "ADMIN",
+        motDePasseTemporaire: motDePasse
+      });
+    } catch (emailErr) {
+      console.error("Erreur envoi email bienvenue admin:", emailErr.message);
+    }
+
     const adminResponse = {
       _id: admin._id,
       nom: admin.nom,
@@ -92,7 +105,7 @@ exports.creerAdmin = async (req, res) => {
     };
 
     res.status(201).json({ 
-      message: "Admin créé avec succès", 
+      message: "Admin créé avec succès. Un email de bienvenue a été envoyé.", 
       user: adminResponse 
     });
   } catch (err) {

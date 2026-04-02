@@ -1,5 +1,6 @@
 const Utilisateur = require("../models/Utilisateur");
 const Ticket = require("../models/Ticket");
+const { envoyerEmailBienvenueCompte } = require("../config/email");
 
 // 🔹 Vérifier si la date de présence est aujourd'hui
 const estPresentAujourdhui = (user) => {
@@ -81,6 +82,18 @@ exports.creerTechnicien = async (req, res) => {
       emailVerifie: true // Technicien créé par admin → pas de vérification email
     });
 
+    // 🔹 Envoyer l'email de bienvenue avec identifiants temporaires
+    try {
+      await envoyerEmailBienvenueCompte({
+        email: emailNormalise,
+        nom,
+        role: "TECHNICIEN",
+        motDePasseTemporaire: motDePasse
+      });
+    } catch (emailErr) {
+      console.error("Erreur envoi email bienvenue technicien:", emailErr.message);
+    }
+
     // ✅ Ne jamais retourner le mot de passe
     const technicienResponse = {
       _id: technicien._id,
@@ -94,7 +107,10 @@ exports.creerTechnicien = async (req, res) => {
       updatedAt: technicien.updatedAt
     };
 
-    res.status(201).json(technicienResponse);
+    res.status(201).json({ 
+      message: "Technicien créé avec succès. Un email de bienvenue a été envoyé.", 
+      user: technicienResponse 
+    });
   } catch (err) {
     res.status(400).json({ message: err.message });
   }
@@ -146,22 +162,24 @@ exports.assignerTicket = async (req, res) => {
       return res.status(400).json({ message: "Ce technicien n'est pas marqué comme présent aujourd'hui" });
     }
 
-     // Vérifier que le technicien peut traiter ce type de problème
+     // 🔹 UGS = CONFIG_MODEM + DEBIT_FAIBLE | ULS = tous les autres
+    const typesUGS = ["CONFIG_MODEM", "DEBIT_FAIBLE"];
     if (
-      (tech.categorie === "UGS" && ticket.typeProbleme !== "CONFIG_MODEM") ||
-      (tech.categorie === "ULS" && ticket.typeProbleme === "CONFIG_MODEM")
+      (tech.categorie === "UGS" && !typesUGS.includes(ticket.typeProbleme)) ||
+      (tech.categorie === "ULS" && typesUGS.includes(ticket.typeProbleme))
     ) {
       return res.status(400).json({ message: "Ce technicien ne peut pas traiter ce type de problème" });
     }
 
-    // Vérifier nombre max de tickets actifs (OUVERT / EN_COURS)
+    // 🔹 UGS = max 10 tickets actifs | ULS = max 5 tickets actifs
+    const maxTickets = tech.categorie === "UGS" ? 10 : 5;
     const ticketsActifs = await Ticket.countDocuments({
       technicienId,
       statut: { $in: ["EN_COURS"] }
     });
 
-    if (ticketsActifs >= 5) {
-      return res.status(400).json({ message: "Technicien a atteint le nombre maximum de tickets actifs (5)" });
+    if (ticketsActifs >= maxTickets) {
+      return res.status(400).json({ message: `Technicien a atteint le nombre maximum de tickets actifs (${maxTickets})` });
     }
 
     // ✅ ADMIN assigne → OUVERT devient EN_COURS automatiquement
@@ -192,24 +210,24 @@ exports.desactiverUtilisateur = async (req, res) => {
       return res.status(404).json({ message: "Utilisateur introuvable" });
     }
 
-    // 🔹 L'admin ne peut désactiver que des techniciens ou clients
-    if (user.role !== "TECHNICIEN" && user.role !== "CLIENT") {
-      return res.status(403).json({ message: "L'admin ne peut désactiver que des techniciens ou clients" });
+    // 🔹 L'admin ne peut désactiver que des techniciens
+    if (user.role !== "TECHNICIEN") {
+      return res.status(403).json({ message: "L'admin ne peut désactiver que des techniciens" });
     }
 
     // 🔹 Vérifier que le technicien appartient à cet admin
-    if (user.role === "TECHNICIEN" && (!user.creePar || user.creePar.toString() !== req.user.id.toString())) {
+    if (!user.creePar || user.creePar.toString() !== req.user.id.toString()) {
       return res.status(403).json({ message: "Ce technicien n'est pas géré par cet admin" });
     }
 
     if (!user.isActive) {
-      return res.status(400).json({ message: "Utilisateur déjà désactivé" });
+      return res.status(400).json({ message: "Technicien déjà désactivé" });
     }
 
     user.isActive = false;
     await user.save();
 
-    res.json({ message: `${user.role === "TECHNICIEN" ? "Technicien" : "Client"} ${user.nom} désactivé avec succès` });
+    res.json({ message: `Technicien ${user.nom} désactivé avec succès` });
   } catch (err) {
     res.status(500).json({ message: err.message });
   }
@@ -224,24 +242,24 @@ exports.reactiverUtilisateur = async (req, res) => {
       return res.status(404).json({ message: "Utilisateur introuvable" });
     }
 
-    // 🔹 L'admin ne peut réactiver que des techniciens ou clients
-    if (user.role !== "TECHNICIEN" && user.role !== "CLIENT") {
-      return res.status(403).json({ message: "L'admin ne peut réactiver que des techniciens ou clients" });
+    // 🔹 L'admin ne peut réactiver que des techniciens
+    if (user.role !== "TECHNICIEN") {
+      return res.status(403).json({ message: "L'admin ne peut réactiver que des techniciens" });
     }
 
     // 🔹 Vérifier que le technicien appartient à cet admin
-    if (user.role === "TECHNICIEN" && (!user.creePar || user.creePar.toString() !== req.user.id.toString())) {
+    if (!user.creePar || user.creePar.toString() !== req.user.id.toString()) {
       return res.status(403).json({ message: "Ce technicien n'est pas géré par cet admin" });
     }
 
     if (user.isActive) {
-      return res.status(400).json({ message: "Utilisateur déjà actif" });
+      return res.status(400).json({ message: "Technicien déjà actif" });
     }
 
     user.isActive = true;
     await user.save();
 
-    res.json({ message: `${user.role === "TECHNICIEN" ? "Technicien" : "Client"} ${user.nom} réactivé avec succès` });
+    res.json({ message: `Technicien ${user.nom} réactivé avec succès` });
   } catch (err) {
     res.status(500).json({ message: err.message });
   }

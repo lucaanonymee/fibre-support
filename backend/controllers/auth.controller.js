@@ -5,6 +5,35 @@ const { genererCodeVerification, envoyerCodeVerification, envoyerCodeResetPasswo
 
 const JWT_SECRET = process.env.JWT_SECRET;
 const JWT_EXPIRES_IN = process.env.JWT_EXPIRES_IN || "1d";
+const JWT_REFRESH_SECRET = process.env.JWT_REFRESH_SECRET || JWT_SECRET + "_refresh";
+const JWT_REFRESH_EXPIRES_IN = process.env.JWT_REFRESH_EXPIRES_IN || "7d";
+
+// ═══════════════════════════════════════════════════════════════════
+// 🔒 Configuration des cookies httpOnly
+// ═══════════════════════════════════════════════════════════════════
+// httpOnly: true  → JavaScript ne peut PAS lire le cookie (protection XSS)
+// secure: true    → Cookie envoyé uniquement via HTTPS (production)
+// sameSite: strict → Cookie jamais envoyé cross-site (protection CSRF)
+// ═══════════════════════════════════════════════════════════════════
+const cookieOptions = {
+  httpOnly: true,                                    // 🔒 Inaccessible au JavaScript
+  secure: process.env.NODE_ENV === "production",     // 🔒 HTTPS uniquement en production
+  sameSite: "strict",                                // 🔒 Bloque les requêtes cross-site
+  path: "/"                                          // Disponible sur toutes les routes
+};
+
+// 🔹 Options pour le cookie Access Token (courte durée)
+const accessTokenCookieOptions = {
+  ...cookieOptions,
+  maxAge: 24 * 60 * 60 * 1000   // 1 jour (en millisecondes)
+};
+
+// 🔹 Options pour le cookie Refresh Token (longue durée)
+const refreshTokenCookieOptions = {
+  ...cookieOptions,
+  maxAge: 7 * 24 * 60 * 60 * 1000,  // 7 jours
+  path: "/api/refresh-token"          // 🔒 Cookie envoyé UNIQUEMENT pour cette route
+};
 
 // 🔹 Fonction de validation mot de passe
 const validatePassword = (motDePasse) => {
@@ -109,8 +138,27 @@ exports.login = async (req, res) => {
       { expiresIn: JWT_EXPIRES_IN }
     );
 
-    userResponse.token = token;
+    // 🔹 Générer le Refresh Token
+    const refreshToken = jwt.sign(
+      { id: user._id },
+      JWT_REFRESH_SECRET,
+      { expiresIn: JWT_REFRESH_EXPIRES_IN }
+    );
 
+    // 🔹 Sauvegarder le refresh token en base
+    user.refreshToken = refreshToken;
+    await user.save();
+
+    // ═══════════════════════════════════════════════════════════════
+    // 🔒 Envoyer les tokens dans des cookies httpOnly
+    // ═══════════════════════════════════════════════════════════════
+    // Avant : token envoyé dans le body JSON → stocké en localStorage → vulnérable XSS
+    // Après : token dans cookie httpOnly → invisible au JavaScript → protégé XSS
+    // Le navigateur envoie automatiquement les cookies à chaque requête
+    res.cookie("accessToken", token, accessTokenCookieOptions);
+    res.cookie("refreshToken", refreshToken, refreshTokenCookieOptions);
+
+    // 🔹 Le body ne contient plus les tokens (seulement les infos utilisateur)
     res.json(userResponse);
   } catch (err) {
     res.status(500).json({ message: err.message });
@@ -277,6 +325,60 @@ exports.renvoyerCode = async (req, res) => {
   }
 };
 
+// 🔹 Modifier l'email avant vérification
+// Body: { ancienEmail, nouvelEmail }
+exports.modifierEmail = async (req, res) => {
+  try {
+    const { ancienEmail, nouvelEmail } = req.body;
+    const ancienNormalise = ancienEmail?.trim()?.toLowerCase();
+    const nouveauNormalise = nouvelEmail?.trim()?.toLowerCase();
+
+    // 🔹 Vérifier que les deux champs sont fournis
+    if (!ancienNormalise || !nouveauNormalise) {
+      return res.status(400).json({ message: "Ancien et nouvel email sont requis" });
+    }
+
+    // 🔹 Vérifier que le nouvel email est différent de l'ancien
+    if (ancienNormalise === nouveauNormalise) {
+      return res.status(400).json({ message: "Le nouvel email doit être différent de l'ancien" });
+    }
+
+    // 🔹 Valider le format du nouvel email
+    if (!validateEmail(nouveauNormalise)) {
+      return res.status(400).json({ message: "Format d'email invalide" });
+    }
+
+    // 🔹 Trouver le compte non vérifié avec l'ancien email
+    const user = await Utilisateur.findOne({ email: ancienNormalise, emailVerifie: false });
+    if (!user) {
+      return res.status(404).json({ message: "Compte introuvable ou email déjà vérifié" });
+    }
+
+    // 🔹 Vérifier que le nouvel email n'est pas déjà utilisé par un autre compte
+    const emailExiste = await Utilisateur.findOne({ email: nouveauNormalise });
+    if (emailExiste) {
+      return res.status(400).json({ message: "Cette adresse email est déjà utilisée" });
+    }
+
+    // 🔹 Mettre à jour l'email et générer un nouveau code
+    const code = genererCodeVerification();
+    user.email = nouveauNormalise;
+    user.codeVerification = code;
+    user.codeVerificationExpire = new Date(Date.now() + 10 * 60 * 1000); // 10 min
+    await user.save();
+
+    // 🔹 Envoyer le code au nouvel email
+    await envoyerCodeVerification(nouveauNormalise, code);
+
+    res.json({ 
+      message: "Email modifié avec succès. Un nouveau code de vérification a été envoyé.",
+      email: nouveauNormalise
+    });
+  } catch (err) {
+    res.status(500).json({ message: err.message });
+  }
+};
+
 // 🔹 Étape 1 : Mot de passe oublié - Envoyer un code de réinitialisation
 // Body: { email }
 exports.motDePasseOublie = async (req, res) => {
@@ -400,6 +502,88 @@ exports.resetMotDePasse = async (req, res) => {
     await user.save();
 
     res.json({ message: "✅ Mot de passe réinitialisé avec succès. Vous pouvez maintenant vous connecter." });
+  } catch (err) {
+    res.status(500).json({ message: err.message });
+  }
+};
+
+// 🔹 Refresh Token — Renouveler l'access token sans se reconnecter
+// 🔒 Lit le refresh token depuis le cookie httpOnly (plus depuis le body)
+exports.refreshToken = async (req, res) => {
+  try {
+    // 🔒 Lire le refresh token depuis le cookie httpOnly
+    const refreshToken = req.cookies.refreshToken;
+
+    if (!refreshToken) {
+      return res.status(400).json({ message: "Refresh token requis" });
+    }
+
+    // Vérifier le refresh token
+    let decoded;
+    try {
+      decoded = jwt.verify(refreshToken, JWT_REFRESH_SECRET);
+    } catch (err) {
+      return res.status(401).json({ message: "Refresh token invalide ou expiré" });
+    }
+
+    // Vérifier que le refresh token correspond à celui en base
+    const user = await Utilisateur.findById(decoded.id);
+    if (!user || user.refreshToken !== refreshToken) {
+      return res.status(401).json({ message: "Refresh token invalide" });
+    }
+
+    if (!user.isActive) {
+      return res.status(403).json({ message: "Compte désactivé" });
+    }
+
+    // Générer un nouveau access token
+    const newToken = jwt.sign(
+      { id: user._id, role: user.role, email: user.email },
+      JWT_SECRET,
+      { expiresIn: JWT_EXPIRES_IN }
+    );
+
+    // Générer un nouveau refresh token (rotation)
+    const newRefreshToken = jwt.sign(
+      { id: user._id },
+      JWT_REFRESH_SECRET,
+      { expiresIn: JWT_REFRESH_EXPIRES_IN }
+    );
+
+    user.refreshToken = newRefreshToken;
+    await user.save();
+
+    // 🔒 Envoyer les nouveaux tokens dans des cookies httpOnly
+    res.cookie("accessToken", newToken, accessTokenCookieOptions);
+    res.cookie("refreshToken", newRefreshToken, refreshTokenCookieOptions);
+
+    res.json({ message: "Token renouvelé avec succès" });
+  } catch (err) {
+    res.status(500).json({ message: err.message });
+  }
+};
+
+// 🔹 Logout — Supprimer les cookies et le refresh token en base
+// 🔒 Efface les cookies httpOnly côté navigateur
+exports.logout = async (req, res) => {
+  try {
+    // 🔒 Lire le refresh token depuis le cookie pour le supprimer en base
+    const refreshToken = req.cookies.refreshToken;
+
+    if (refreshToken) {
+      const user = await Utilisateur.findOne({ refreshToken });
+      if (user) {
+        user.refreshToken = null;
+        await user.save();
+      }
+    }
+
+    // 🔒 Supprimer les cookies côté navigateur
+    res.clearCookie("accessToken", { path: "/" });
+    res.clearCookie("refreshToken", { path: "/api/refresh-token" });
+    res.clearCookie("csrf-token", { path: "/" });
+
+    res.json({ message: "Déconnexion réussie" });
   } catch (err) {
     res.status(500).json({ message: err.message });
   }
