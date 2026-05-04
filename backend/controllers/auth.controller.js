@@ -7,6 +7,13 @@ const JWT_SECRET = process.env.JWT_SECRET;
 const JWT_EXPIRES_IN = process.env.JWT_EXPIRES_IN || "1d";
 const JWT_REFRESH_SECRET = process.env.JWT_REFRESH_SECRET || JWT_SECRET + "_refresh";
 const JWT_REFRESH_EXPIRES_IN = process.env.JWT_REFRESH_EXPIRES_IN || "7d";
+const RECAPTCHA_SECRET_KEY = process.env.RECAPTCHA_SECRET_KEY;
+const MAX_CODE_FAILURES = Number.isFinite(Number(process.env.MAX_CODE_FAILURES)) && Number(process.env.MAX_CODE_FAILURES) > 0
+  ? Math.floor(Number(process.env.MAX_CODE_FAILURES))
+  : 5;
+const CODE_BLOCK_MINUTES = Number.isFinite(Number(process.env.CODE_BLOCK_MINUTES)) && Number(process.env.CODE_BLOCK_MINUTES) > 0
+  ? Number(process.env.CODE_BLOCK_MINUTES)
+  : 15;
 
 // ═══════════════════════════════════════════════════════════════════
 // 🔒 Configuration des cookies httpOnly
@@ -71,6 +78,126 @@ const normaliserTelephone = (numero) => {
   return null;
 };
 
+const getBlockedMinutes = (blockedUntil) => {
+  if (!(blockedUntil instanceof Date)) {
+    return 0;
+  }
+
+  const remainingMs = blockedUntil.getTime() - Date.now();
+  if (remainingMs <= 0) {
+    return 0;
+  }
+
+  return Math.max(1, Math.ceil(remainingMs / 60000));
+};
+
+const isCodeTemporarilyBlocked = (user) => {
+  if (!user?.blocageCodeJusqua) {
+    return false;
+  }
+
+  const blockedUntil = new Date(user.blocageCodeJusqua);
+  return blockedUntil > new Date();
+};
+
+const buildCodeBlockedMessage = (user) => {
+  const blockedUntil = user?.blocageCodeJusqua ? new Date(user.blocageCodeJusqua) : null;
+  const remainingMinutes = getBlockedMinutes(blockedUntil);
+
+  if (remainingMinutes <= 0) {
+    return "Trop de codes incorrects. Réessayez plus tard.";
+  }
+
+  return `Trop de codes incorrects. Réessayez dans ${remainingMinutes} minute(s).`;
+};
+
+const clearInvalidCodeProtection = (user) => {
+  user.tentativesCodeInvalide = 0;
+  user.blocageCodeJusqua = null;
+};
+
+const registerInvalidCodeAttempt = async (user) => {
+  const currentAttempts = Number.isFinite(Number(user.tentativesCodeInvalide))
+    ? Number(user.tentativesCodeInvalide)
+    : 0;
+
+  const nextAttempts = currentAttempts + 1;
+  const shouldBlock = nextAttempts >= MAX_CODE_FAILURES;
+
+  if (shouldBlock) {
+    user.tentativesCodeInvalide = 0;
+    user.blocageCodeJusqua = new Date(Date.now() + CODE_BLOCK_MINUTES * 60 * 1000);
+  } else {
+    user.tentativesCodeInvalide = nextAttempts;
+  }
+
+  await user.save();
+  return shouldBlock;
+};
+
+const verifyRecaptchaToken = async (token, remoteIp) => {
+  if (!token || typeof token !== "string" || !token.trim()) {
+    return {
+      ok: false,
+      status: 400,
+      message: "Validation reCAPTCHA requise"
+    };
+  }
+
+  if (!RECAPTCHA_SECRET_KEY) {
+    return {
+      ok: false,
+      status: 500,
+      message: "Configuration reCAPTCHA manquante cote serveur"
+    };
+  }
+
+  const params = new URLSearchParams({
+    secret: RECAPTCHA_SECRET_KEY,
+    response: token.trim(),
+  });
+
+  if (remoteIp) {
+    params.append("remoteip", remoteIp);
+  }
+
+  try {
+    const response = await fetch("https://www.google.com/recaptcha/api/siteverify", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/x-www-form-urlencoded",
+      },
+      body: params.toString(),
+    });
+
+    if (!response.ok) {
+      return {
+        ok: false,
+        status: 502,
+        message: "Service reCAPTCHA indisponible. Reessayez plus tard"
+      };
+    }
+
+    const payload = await response.json();
+
+    if (!payload?.success) {
+      return {
+        ok: false,
+        status: 400,
+        message: "Validation reCAPTCHA invalide. Cochez \"I'm not a robot\" puis reessayez"
+      };
+    }
+
+    return { ok: true };
+  } catch (error) {
+    return {
+      ok: false,
+      status: 502,
+      message: "Service reCAPTCHA indisponible. Reessayez plus tard"
+    };
+  }
+};
+
 // 🔹 Login client/admin/technicien
 exports.login = async (req, res) => {
   try {
@@ -84,12 +211,12 @@ exports.login = async (req, res) => {
     const user = await Utilisateur.findOne({ email });
 
     if (!user) {
-      return res.status(401).json({ message: "Login incorrect" });
+      return res.status(401).json({ message: "Email invalide ou inexistant." });
     }
 
     const motDePasseValide = await bcrypt.compare(motDePasse, user.motDePasse);
     if (!motDePasseValide) {
-      return res.status(401).json({ message: "Login incorrect" });
+      return res.status(401).json({ message: "Mot de passe incorrect." });
     }
 
     // 🔹 Vérifier si le compte est actif (soft delete)
@@ -168,7 +295,7 @@ exports.login = async (req, res) => {
 // 🔹 Register client
 exports.registerClient = async (req, res) => {
   try {
-    const { nom, email, motDePasse, numTelephone } = req.body;
+    const { nom, email, motDePasse, numTelephone, recaptchaToken } = req.body;
     const emailNormalise = email?.trim()?.toLowerCase();
 
     // 🔹 Vérifier que tous les champs obligatoires sont fournis et non vides
@@ -176,6 +303,11 @@ exports.registerClient = async (req, res) => {
       return res.status(400).json({ 
         message: "Tous les champs sont obligatoires : nom, email, mot de passe et numéro de téléphone" 
       });
+    }
+
+    const recaptcha = await verifyRecaptchaToken(recaptchaToken, req.ip);
+    if (!recaptcha.ok) {
+      return res.status(recaptcha.status).json({ message: recaptcha.message });
     }
 
     // 🔹 Valider le format de l'email
@@ -228,6 +360,7 @@ exports.registerClient = async (req, res) => {
     const code = genererCodeVerification();
     user.codeVerification = code;
     user.codeVerificationExpire = new Date(Date.now() + 10 * 60 * 1000); // 10 min
+    clearInvalidCodeProtection(user);
     await user.save();
 
     await envoyerCodeVerification(emailNormalise, code);
@@ -258,8 +391,9 @@ exports.verifierEmail = async (req, res) => {
   try {
     const { email, code } = req.body;
     const emailNormalise = email?.trim()?.toLowerCase();
+    const codeSaisi = code?.trim();
 
-    if (!emailNormalise || !code?.trim()) {
+    if (!emailNormalise || !codeSaisi) {
       return res.status(400).json({ message: "Email et code sont requis" });
     }
 
@@ -269,11 +403,29 @@ exports.verifierEmail = async (req, res) => {
       return res.status(404).json({ message: "Utilisateur introuvable" });
     }
 
+    if (user.role !== "CLIENT") {
+      return res.status(403).json({ message: "La vérification email est réservée aux comptes client" });
+    }
+
     if (user.emailVerifie) {
       return res.status(400).json({ message: "Email déjà vérifié" });
     }
 
-    if (user.codeVerification !== code) {
+    if (!user.isActive) {
+      return res.status(403).json({ message: "Compte désactivé. Contactez l'administrateur." });
+    }
+
+    if (isCodeTemporarilyBlocked(user)) {
+      return res.status(429).json({ message: buildCodeBlockedMessage(user) });
+    }
+
+    if (user.codeVerification !== codeSaisi) {
+      const userBlocked = await registerInvalidCodeAttempt(user);
+
+      if (userBlocked) {
+        return res.status(429).json({ message: buildCodeBlockedMessage(user) });
+      }
+
       return res.status(400).json({ message: "Code de vérification incorrect" });
     }
 
@@ -284,9 +436,57 @@ exports.verifierEmail = async (req, res) => {
     user.emailVerifie = true;
     user.codeVerification = null;
     user.codeVerificationExpire = null;
+    clearInvalidCodeProtection(user);
+
+    // Ouvre directement une session apres verification reussie.
+    const token = jwt.sign(
+      {
+        id: user._id,
+        role: user.role,
+        email: user.email
+      },
+      JWT_SECRET,
+      { expiresIn: JWT_EXPIRES_IN }
+    );
+
+    const refreshToken = jwt.sign(
+      { id: user._id },
+      JWT_REFRESH_SECRET,
+      { expiresIn: JWT_REFRESH_EXPIRES_IN }
+    );
+
+    user.refreshToken = refreshToken;
     await user.save();
 
-    res.json({ message: "✅ Email vérifié avec succès. Vous pouvez maintenant vous connecter." });
+    const userResponse = {
+      _id: user._id,
+      nom: user.nom,
+      email: user.email,
+      role: user.role,
+      creePar: user.creePar,
+      createdAt: user.createdAt,
+      updatedAt: user.updatedAt
+    };
+
+    if (user.role === "ADMIN" || user.role === "TECHNICIEN") {
+      userResponse.zoneIntervention = user.zoneIntervention;
+    }
+
+    if (user.role === "TECHNICIEN" && user.categorie) {
+      userResponse.categorie = user.categorie;
+    }
+
+    if (user.role === "SUPER_ADMIN") {
+      userResponse.role = "SUPER_ADMIN";
+    }
+
+    res.cookie("accessToken", token, accessTokenCookieOptions);
+    res.cookie("refreshToken", refreshToken, refreshTokenCookieOptions);
+
+    res.json({
+      message: "✅ Email vérifié avec succès. Connexion automatique effectuée.",
+      user: userResponse
+    });
   } catch (err) {
     res.status(500).json({ message: err.message });
   }
@@ -308,6 +508,10 @@ exports.renvoyerCode = async (req, res) => {
       return res.status(404).json({ message: "Utilisateur introuvable" });
     }
 
+    if (user.role !== "CLIENT") {
+      return res.status(403).json({ message: "La vérification email est réservée aux comptes client" });
+    }
+
     if (user.emailVerifie) {
       return res.status(400).json({ message: "Email déjà vérifié" });
     }
@@ -315,6 +519,7 @@ exports.renvoyerCode = async (req, res) => {
     const code = genererCodeVerification();
     user.codeVerification = code;
     user.codeVerificationExpire = new Date(Date.now() + 10 * 60 * 1000);
+    clearInvalidCodeProtection(user);
     await user.save();
 
     await envoyerCodeVerification(emailNormalise, code);
@@ -354,6 +559,10 @@ exports.modifierEmail = async (req, res) => {
       return res.status(404).json({ message: "Compte introuvable ou email déjà vérifié" });
     }
 
+    if (user.role !== "CLIENT") {
+      return res.status(403).json({ message: "La vérification email est réservée aux comptes client" });
+    }
+
     // 🔹 Vérifier que le nouvel email n'est pas déjà utilisé par un autre compte
     const emailExiste = await Utilisateur.findOne({ email: nouveauNormalise });
     if (emailExiste) {
@@ -365,6 +574,7 @@ exports.modifierEmail = async (req, res) => {
     user.email = nouveauNormalise;
     user.codeVerification = code;
     user.codeVerificationExpire = new Date(Date.now() + 10 * 60 * 1000); // 10 min
+    clearInvalidCodeProtection(user);
     await user.save();
 
     // 🔹 Envoyer le code au nouvel email
@@ -383,7 +593,7 @@ exports.modifierEmail = async (req, res) => {
 // Body: { email }
 exports.motDePasseOublie = async (req, res) => {
   try {
-    const { email } = req.body;
+    const { email, recaptchaToken } = req.body;
     const emailNormalise = email?.trim()?.toLowerCase();
 
     if (!emailNormalise) {
@@ -392,6 +602,11 @@ exports.motDePasseOublie = async (req, res) => {
 
     if (!validateEmail(emailNormalise)) {
       return res.status(400).json({ message: "Format d'email invalide" });
+    }
+
+    const recaptcha = await verifyRecaptchaToken(recaptchaToken, req.ip);
+    if (!recaptcha.ok) {
+      return res.status(recaptcha.status).json({ message: recaptcha.message });
     }
 
     const user = await Utilisateur.findOne({ email: emailNormalise });
@@ -414,6 +629,7 @@ exports.motDePasseOublie = async (req, res) => {
     user.codeVerification = code;
     user.codeVerificationExpire = new Date(Date.now() + 10 * 60 * 1000); // 10 min
     user.codeResetVerifie = false;
+    clearInvalidCodeProtection(user);
     await user.save();
 
     // 🔹 Envoyer l'email
@@ -431,19 +647,40 @@ exports.verifierCodeReset = async (req, res) => {
   try {
     const { email, code } = req.body;
     const emailNormalise = email?.trim()?.toLowerCase();
+    const codeSaisi = code?.trim();
 
-    if (!emailNormalise || !code?.trim()) {
+    if (!emailNormalise || !codeSaisi) {
       return res.status(400).json({ message: "Email et code requis" });
     }
 
-    // 🔹 Chercher l'utilisateur par son code de réinitialisation
-    const user = await Utilisateur.findOne({ 
-      email: emailNormalise,
-      codeVerification: code,
-      codeVerificationExpire: { $gt: new Date() }
-    });
+    // 🔹 Chercher l'utilisateur pour vérifier le code
+    const user = await Utilisateur.findOne({ email: emailNormalise });
 
     if (!user) {
+      return res.status(400).json({ message: "Code incorrect ou expiré" });
+    }
+
+    if (user.role === "SUPER_ADMIN") {
+      return res.status(403).json({ message: "Fonctionnalité non disponible pour le Super Admin" });
+    }
+
+    if (isCodeTemporarilyBlocked(user)) {
+      return res.status(429).json({ message: buildCodeBlockedMessage(user) });
+    }
+
+    const codeValide =
+      user.codeVerification
+      && user.codeVerificationExpire
+      && user.codeVerification === codeSaisi
+      && user.codeVerificationExpire > new Date();
+
+    if (!codeValide) {
+      const userBlocked = await registerInvalidCodeAttempt(user);
+
+      if (userBlocked) {
+        return res.status(429).json({ message: buildCodeBlockedMessage(user) });
+      }
+
       return res.status(400).json({ message: "Code incorrect ou expiré" });
     }
 
@@ -451,6 +688,7 @@ exports.verifierCodeReset = async (req, res) => {
     user.codeResetVerifie = true;
     user.codeVerification = null;
     user.codeVerificationExpire = null;
+    clearInvalidCodeProtection(user);
     await user.save();
 
     res.json({ message: "✅ Code vérifié avec succès. Vous pouvez maintenant réinitialiser votre mot de passe." });
@@ -490,6 +728,10 @@ exports.resetMotDePasse = async (req, res) => {
       return res.status(400).json({ message: "Aucune demande de réinitialisation en cours. Recommencez le processus." });
     }
 
+    if (user.role === "SUPER_ADMIN") {
+      return res.status(403).json({ message: "Fonctionnalité non disponible pour le Super Admin" });
+    }
+
     // 🔹 Vérifier que le nouveau mdp n'est pas l'ancien
     const memeMotDePasse = await bcrypt.compare(nouveauMotDePasse, user.motDePasse);
     if (memeMotDePasse) {
@@ -499,6 +741,7 @@ exports.resetMotDePasse = async (req, res) => {
     // 🔹 Mettre à jour le mot de passe et nettoyer
     user.motDePasse = nouveauMotDePasse;
     user.codeResetVerifie = false;
+    clearInvalidCodeProtection(user);
     await user.save();
 
     res.json({ message: "✅ Mot de passe réinitialisé avec succès. Vous pouvez maintenant vous connecter." });
@@ -584,6 +827,30 @@ exports.logout = async (req, res) => {
     res.clearCookie("csrf-token", { path: "/" });
 
     res.json({ message: "Déconnexion réussie" });
+  } catch (err) {
+    res.status(500).json({ message: err.message });
+  }
+};
+
+// 🔹 Session courante — retourne l'utilisateur authentifié
+exports.me = async (req, res) => {
+  try {
+    const user = await Utilisateur.findById(req.user.id)
+      .select("_id nom email role isActive createdAt updatedAt");
+
+    if (!user || !user.isActive) {
+      return res.status(401).json({ message: "Session invalide" });
+    }
+
+    res.json({
+      _id: user._id,
+      nom: user.nom,
+      email: user.email,
+      role: user.role,
+      isActive: user.isActive,
+      createdAt: user.createdAt,
+      updatedAt: user.updatedAt,
+    });
   } catch (err) {
     res.status(500).json({ message: err.message });
   }

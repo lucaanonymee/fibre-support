@@ -1,107 +1,74 @@
-TYPESCRIPT 
-leaflet.js
-jwt
-https/tls 
+# Smart Fibre TT
 
+Plateforme full-stack de gestion d'incidents fibre optique avec 4 roles metier:
+SUPER_ADMIN, ADMIN, TECHNICIEN et CLIENT.
 
+## Documentation du projet
 
-
-
-# Smart Fibre TT — Système de Gestion de Tickets
-
-Application web full-stack de gestion de tickets pour une entreprise de fibre optique. Elle permet aux clients de signaler des problèmes liés à la fibre, aux administrateurs de gérer et assigner les tickets, et aux techniciens de les résoudre sur le terrain.
+- README general: ce fichier
+- Frontend: [frontend/README.md](frontend/README.md)
+- Backend API: [backend/README.md](backend/README.md)
 
 ## Architecture
 
-Le projet suit l'architecture **MERN** (MongoDB, Express, React, Node.js) avec une séparation claire entre le frontend et le backend.
+Le projet est separe en deux applications:
 
 ```
-├── backend/          # API REST (Express / Node.js)
-│   ├── config/       # Configuration DB & Email
-│   ├── controllers/  # Logique métier
-│   ├── middlewares/   # Authentification & autorisation
-│   ├── models/        # Modèles Mongoose (Utilisateur, Ticket)
-│   └── routes/        # Définition des routes API
-└── frontend/         # Application React (Vite)
-    └── src/
+.
+├── backend/   # API REST Express + MongoDB
+└── frontend/  # Application React (Vite)
 ```
 
-## Technologies utilisées
+## Fonctionnalites principales
 
-### Frontend
+- Authentification JWT avec cookies httpOnly
+- Verification CSRF (double submit cookie)
+- Gestion complete du cycle de ticket: OUVERT -> EN_COURS -> CLOTURE
+- Attribution automatique d'un admin selon la zone geographique
+- Gestion des techniciens (presence, categorie UGS/ULS, capacite)
+- Reference metier ticket au format TT-<numero>
+- Numero de telephone obligatoire uniquement pour le role CLIENT
+- Notifications email (verification compte, reset mot de passe, cloture ticket)
 
-| Technologie | Version | Description |
-|---|---|---|
-| **React** | 19.2 | Bibliothèque UI pour la construction d'interfaces |
-| **React DOM** | 19.2 | Rendu React dans le navigateur |
-| **React Router DOM** | 7.13 | Routage côté client (SPA) |
-| **Axios** | 1.13 | Client HTTP pour les appels API |
-| **Vite** | 7.2 | Outil de build & serveur de développement rapide |
-| **ESLint** | 9.39 | Linting et qualité de code |
+## Stack technique
 
 ### Backend
 
-| Technologie | Version | Description |
-|---|---|---|
-| **Node.js** | — | Environnement d'exécution JavaScript côté serveur |
-| **Express** | 5.2 | Framework web minimaliste pour l'API REST |
-| **Mongoose** | 9.1 | ODM pour MongoDB (modèles, schémas, requêtes) |
-| **JSON Web Token (JWT)** | 9.0 | Authentification par tokens |
-| **bcryptjs** | 2.4 | Hachage sécurisé des mots de passe |
-| **Nodemailer** | 8.0 | Envoi d'emails (vérification, réinitialisation) |
-| **dotenv** | 17.2 | Gestion des variables d'environnement |
-| **CORS** | 2.8 | Gestion des requêtes cross-origin |
-| **Nodemon** | 3.1 | Rechargement automatique en développement |
+- Node.js + Express 5
+- MongoDB + Mongoose
+- JWT + bcryptjs
+- Helmet, CORS, CSRF, Rate limit, mongo sanitize
+- Nodemailer
 
-### Base de données
+### Frontend 
+- React + Vite + TypeScript
+- React Router (multi-roles)
+- Leaflet (cartographie)
+- Lucide React
+- Recharts
 
-| Technologie | Description |
-|---|---|
-| **MongoDB** | Base de données NoSQL orientée documents |
-| **Mongoose** | Modélisation des données avec support GeoJSON |
+## Demarrage rapide
 
-## Fonctionnalités principales
+Option A - Lancement simultane backend + frontend (nouveau)
 
-- **Authentification & Autorisation** : JWT + bcrypt avec contrôle d'accès basé sur les rôles (RBAC)
-- **4 rôles hiérarchiques** : `SUPER_ADMIN` → `ADMIN` → `TECHNICIEN` → `CLIENT`
-- **Gestion de tickets** : Création, assignation et suivi (OUVERT → EN_COURS → CLOTURE)
-- **Géolocalisation** : Zones d'intervention GeoJSON pour les admins et techniciens
-- **Notifications email** : Vérification de compte et réinitialisation de mot de passe (Gmail SMTP)
-- **Suivi de présence** : Gestion de la présence quotidienne des techniciens
-- **Catégories de techniciens** : UGS (intervention à distance) / ULS (intervention sur site)
-- **Soft delete** : Désactivation de comptes sans suppression définitive
-- **Priorité IA** : Champs prévus pour la priorisation intelligente des tickets
+```bash
+npm install
+npm run dev
+```
 
-## Routes API
+Cette commande se lance a la racine du projet et demarre les deux services via concurrently.
 
-| Module | Endpoint | Description |
-|---|---|---|
-| Auth | `/api/auth/*` | Connexion, inscription client, vérification email, reset mot de passe |
-| Super Admin | `/api/superadmin/*` | Gestion des administrateurs |
-| Admin | `/api/admin/*` | Gestion des techniciens et des tickets |
-| Client | `/api/client/*` | Soumission et consultation des tickets |
-| Technicien | `/api/technicien/*` | Traitement des tickets assignés |
-| Utilisateur | `/api/utilisateur/*` | Gestion du profil utilisateur |
+Option B - Lancement separe (comme actuellement)
 
-## Installation
-
-### Prérequis
-
-- Node.js (v18+)
-- MongoDB (local ou Atlas)
-- Compte Gmail avec mot de passe d'application (pour Nodemailer)
-
-### Backend
+1. Lancer le backend
 
 ```bash
 cd backend
 npm install
-# Créer un fichier .env avec les variables nécessaires :
-# MONGO_URI, JWT_SECRET, EMAIL_USER, EMAIL_PASSWORD, PORT
 npm run dev
 ```
 
-### Frontend
+2. Lancer le frontend
 
 ```bash
 cd frontend
@@ -109,19 +76,20 @@ npm install
 npm run dev
 ```
 
-Le frontend proxy automatiquement les requêtes `/api` vers `http://localhost:5000` grâce à la configuration Vite.
+3. Verifier l'API
+
+- Test backend: GET http://localhost:5000/api/test
+- Frontend Vite: http://localhost:5173
 
 ## Variables d'environnement
 
-Créer un fichier `.env` dans le dossier `backend/` :
+- Backend: voir [backend/README.md](backend/README.md)
+- Frontend: voir [frontend/README.md](frontend/README.md)
 
-```env
-PORT=5000
-MONGO_URI=mongodb://localhost:27017/smart-fibre-tt
-JWT_SECRET=votre_secret_jwt
-EMAIL_USER=votre_email@gmail.com
-EMAIL_PASSWORD=votre_mot_de_passe_application
-```
+## Notes
+
+- Le frontend utilise des URLs relatives vers /api par defaut.
+- Une URL backend explicite peut etre configuree via VITE_API_BASE_URL cote frontend.
 
 
 

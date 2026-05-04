@@ -4,10 +4,12 @@ const cors = require("cors");
 const helmet = require("helmet");
 const cookieParser = require("cookie-parser");
 const mongoSanitize = require("express-mongo-sanitize");
+const path = require("path");
 require("dotenv").config();
 
 // 🔹 Config DB
 const connectDB = require("./config/db");
+const Utilisateur = require("./models/Utilisateur");
 
 // 🔒 Middlewares de sécurité
 const { globalLimiter } = require("./middlewares/rateLimit.middleware");
@@ -19,9 +21,41 @@ const superadminRoutes = require("./routes/superadmin.routes");
 const adminRoutes = require("./routes/admin.routes");
 const clientRoutes = require("./routes/client.routes");
 const technicienRoutes = require("./routes/technicien.routes");
-const utilisateurRoutes = require("./routes/utilisateur.routes");
+const profileRoutes = require("./routes/profile.routes");
+const aiRoutes = require("./routes/ai.routes");
+const { warmupPythonPrediction } = require("./services/ai.service");
 
 const app = express();
+
+const getPositiveNumber = (value, fallback) => {
+  const parsed = Number(value);
+  if (!Number.isFinite(parsed) || parsed <= 0) {
+    return fallback;
+  }
+
+  return parsed;
+};
+
+const UNVERIFIED_ACCOUNT_RETENTION_DAYS = getPositiveNumber(process.env.UNVERIFIED_ACCOUNT_RETENTION_DAYS, 3);
+const UNVERIFIED_CLEANUP_INTERVAL_MS = getPositiveNumber(process.env.UNVERIFIED_CLEANUP_INTERVAL_MS, 24 * 60 * 60 * 1000);
+
+const nettoyerComptesNonVerifies = async () => {
+  try {
+    const cutoff = new Date(Date.now() - UNVERIFIED_ACCOUNT_RETENTION_DAYS * 24 * 60 * 60 * 1000);
+
+    const result = await Utilisateur.deleteMany({
+      role: "CLIENT",
+      emailVerifie: false,
+      createdAt: { $lt: cutoff }
+    });
+
+    if (result.deletedCount > 0) {
+      console.log(`🧹 Nettoyage comptes non verifies: ${result.deletedCount} compte(s) supprime(s).`);
+    }
+  } catch (error) {
+    console.error("Erreur nettoyage comptes non verifies:", error.message);
+  }
+};
 
 // ═══════════════════════════════════════════════════════════════════
 // 🔒 1. HELMET — Sécurisation des headers HTTP
@@ -55,8 +89,8 @@ app.use(helmet.hsts({
 app.use(cors({
   origin: ["http://localhost:5173", "http://localhost:3000"],
   credentials: true,          // 🔹 INDISPENSABLE pour les cookies httpOnly
-  methods: ["GET", "POST", "PUT", "DELETE", "OPTIONS"],
-  allowedHeaders: ["Content-Type", "x-csrf-token"]  // 🔹 Autorise le header CSRF
+  methods: ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
+  allowedHeaders: ["Content-Type", "x-csrf-token", "Authorization"]  // 🔹 Autorise CSRF + token header
 }));
 
 // ═══════════════════════════════════════════════════════════════════
@@ -75,7 +109,7 @@ app.use(express.urlencoded({ extended: false, limit: "10kb" }));
 
 // ═══════════════════════════════════════════════════════════════════
 // 🔒 6. NoSQL Injection Protection
-// ═══════════════════════════════════════════════════════════════════
+// ════════════════════════════════════
 // Supprime les opérateurs MongoDB ($gt, $ne, $or...) des requêtes
 // Exemple d'attaque bloquée :
 //   { "email": { "$gt": "" }, "motDePasse": { "$gt": "" } }
@@ -175,7 +209,7 @@ app.use((req, res, next) => {
   res.removeHeader("X-Powered-By");
 
   // 🔹 Permissions-Policy : désactive les APIs navigateur inutiles
-  res.setHeader("Permissions-Policy", "camera=(), microphone=(), geolocation=(), payment=()");
+  res.setHeader("Permissions-Policy", "camera=(), microphone=(), payment=()");
 
   next();
 });
@@ -189,13 +223,25 @@ app.get("/", (req, res) => {
   res.send("Backend is running");
 });
 
+// 🔹 Fichiers statiques uploades (photos profil)
+app.use(
+  "/uploads",
+  (req, res, next) => {
+    // Allow frontend (different origin/port) to render profile images.
+    res.setHeader("Cross-Origin-Resource-Policy", "cross-origin");
+    next();
+  },
+  express.static(path.join(__dirname, "uploads"))
+);
+
 // 🔹 Routes principales
 app.use(authRoutes);          // login / register client
 app.use(superadminRoutes);    // création admin (par super admin)
 app.use(adminRoutes);         // création technicien + gestion tickets
 app.use(clientRoutes);        // tickets client
 app.use(technicienRoutes);    // tickets technicien
-app.use(utilisateurRoutes);   // profil utilisateur
+app.use(profileRoutes);       // profil utilisateur
+app.use(aiRoutes);            // prediction IA
 
 // 🔹 Route 404 - Endpoint non trouvé
 app.use((req, res) => {
@@ -230,5 +276,15 @@ connectDB().then(() => {
   app.listen(process.env.PORT || 5000, () => {
     console.log(`Serveur lancé sur http://localhost:${process.env.PORT || 5000}`);
     console.log("🔒 Sécurité : Helmet, HSTS, CORS, CSRF, Rate Limit, XSS, NoSQL Sanitize activés");
+    warmupPythonPrediction();
+    void nettoyerComptesNonVerifies();
+
+    const cleanupTimer = setInterval(() => {
+      void nettoyerComptesNonVerifies();
+    }, UNVERIFIED_CLEANUP_INTERVAL_MS);
+
+    if (typeof cleanupTimer.unref === "function") {
+      cleanupTimer.unref();
+    }
   });
 });

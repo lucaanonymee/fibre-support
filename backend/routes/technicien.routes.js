@@ -1,7 +1,9 @@
 const router = require("express").Router();
 const tech = require("../controllers/technicien.controller");
+const profile = require("../controllers/profile.controller");
 const { authenticateToken } = require("../middlewares/auth.middleware");
 const { authorizeRoles } = require("../middlewares/role.middleware");
+const { uploadProfilePhoto } = require("../middlewares/profileUpload.middleware");
 
 const auth = [authenticateToken, authorizeRoles("TECHNICIEN")];
 
@@ -13,6 +15,9 @@ router.put("/api/technicien/ticket/:id", auth, tech.mettreAJourTicket);
 
 // 🔹 Historique des tickets par SN
 router.get("/api/technicien/historique/:sn", auth, tech.historiqueBySN);
+
+router.get("/api/technicien/profile", auth, profile.getProfile);
+router.patch("/api/technicien/profile/photo", auth, uploadProfilePhoto, profile.updateProfilePhoto);
 
 module.exports = router;
 

@@ -10,11 +10,14 @@ const auth = [authenticateToken, authorizeRoles("SUPER_ADMIN")];
 // 🔹 Création d'un Admin (par Super Admin)
 router.post("/api/superadmin/admin", auth, superadmin.creerAdmin);
 
-// 🔹 Lister tous les admins
-router.get("/api/superadmin/admins", auth, superadmin.listerAdmins);
+// 🔹 Lister tous les utilisateurs (ADMIN / CLIENT / TECHNICIEN)
+router.get("/api/superadmin/utilisateurs", auth, superadmin.listerUtilisateurs);
 
-// 🔹 Désactiver / Réactiver un admin
-router.put("/api/superadmin/desactiver/:id", auth, superadmin.desactiverAdmin);
-router.put("/api/superadmin/reactiver/:id", auth, superadmin.reactiverAdmin);
+// 🔹 Journal des actions superadmin
+router.get("/api/superadmin/actions", auth, superadmin.listerActions);
+
+// 🔹 Désactiver / Réactiver un utilisateur (hors SUPER_ADMIN)
+router.put("/api/superadmin/desactiver/:id", auth, superadmin.desactiverUtilisateur);
+router.put("/api/superadmin/reactiver/:id", auth, superadmin.reactiverUtilisateur);
 
 module.exports = router;

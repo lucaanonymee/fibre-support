@@ -1,11 +1,54 @@
 const Ticket = require("../models/Ticket");
+const Counter = require("../models/Counter");
 const Utilisateur = require("../models/Utilisateur");
+const { runPythonPrediction } = require("../services/ai.service");
+
+const MAX_TICKET_SEQUENCE = 9999999;
+const TICKET_COUNTER_ID = "ticketRef";
+const SUPPORT_SCHEDULE = {
+  reclamations: "24/7",
+  traitement: {
+    lundiVendredi: "08:00-18:00",
+    samedi: "08:00-12:00",
+  },
+};
+
+const hideAiMetricsForClient = (ticketDoc) => {
+  const ticket = ticketDoc?.toObject ? ticketDoc.toObject() : { ...ticketDoc };
+
+  delete ticket.aiScore;
+  delete ticket.priorite;
+  delete ticket.tempsReponsePrevu;
+
+  return ticket;
+};
 
 
 // 🔹 Validation du SN : 16 caractères, uniquement majuscules et chiffres
 const validateSN = (sn) => {
   const regex = /^[A-Z0-9]{16}$/;
   return regex.test(sn);
+};
+
+const generateNextTicketRef = async () => {
+  try {
+    const counter = await Counter.findOneAndUpdate(
+      { _id: TICKET_COUNTER_ID, seq: { $lt: MAX_TICKET_SEQUENCE } },
+      { $inc: { seq: 1 } },
+      { new: true, upsert: true, setDefaultsOnInsert: true }
+    );
+
+    if (!counter) {
+      throw new Error("Plage des references ticket epuisee (TT-1 a TT-9999999)");
+    }
+
+    return `TT-${counter.seq}`;
+  } catch (err) {
+    if (err?.code === 11000) {
+      throw new Error("Plage des references ticket epuisee (TT-1 a TT-9999999)");
+    }
+    throw err;
+  }
 };
 
 // 🔹 Créer un ticket + assigner automatiquement un admin selon localisation
@@ -97,14 +140,40 @@ exports.creerTicket = async (req, res) => {
       }
     }
 
+    const ticketRef = await generateNextTicketRef();
+    const creationDate = new Date();
+
+    // Charge admin locale (et non globale) pour la feature IA.
+    const nbTicketsOuvertsAdmin = await Ticket.countDocuments({
+      adminId: adminSelectionne._id,
+      statut: { $in: ["OUVERT", "EN_COURS"] },
+    });
+
+    let prediction = null;
+    try {
+      prediction = await runPythonPrediction({
+        typeProbleme,
+        nbTicketsOuverts_admin: nbTicketsOuvertsAdmin,
+        creationDate: creationDate.toISOString(),
+      });
+    } catch (predictionError) {
+      // Ne bloque pas la creation ticket si le module IA n'est pas disponible.
+      console.error("Prediction IA indisponible:", predictionError.message);
+    }
+
     // 🔹 Création ticket (statut OUVERT, assignationDate vide)
     const ticket = await Ticket.create({
       sn,
+      ticketRef,
       typeProbleme,
       description: description || null,
       localisation,
       clientId,
-      adminId: adminSelectionne._id
+      adminId: adminSelectionne._id,
+      creationDate,
+      aiScore: prediction?.score,
+      tempsReponsePrevu: prediction?.tempsReponsePrevu,
+      priorite: prediction?.priorite,
     });
 
     // 🔹 Peupler admin pour retour
@@ -112,7 +181,8 @@ exports.creerTicket = async (req, res) => {
 
     res.status(201).json({
       message: "Ticket créé et assigné automatiquement à un admin",
-      ticket
+      horairesSupport: SUPPORT_SCHEDULE,
+      ticket: hideAiMetricsForClient(ticket),
     });
 
   } catch (err) {
@@ -137,7 +207,9 @@ exports.consulterTicketsClient = async (req, res) => {
       });
     }
 
-    res.json(tickets);
+    const ticketsSanitizes = tickets.map(hideAiMetricsForClient);
+
+    res.json(ticketsSanitizes);
 
   } catch (err) {
     res.status(500).json({ message: err.message });

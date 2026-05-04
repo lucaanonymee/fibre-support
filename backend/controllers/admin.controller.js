@@ -1,6 +1,39 @@
+const mongoose = require("mongoose");
 const Utilisateur = require("../models/Utilisateur");
 const Ticket = require("../models/Ticket");
 const { envoyerEmailBienvenueCompte } = require("../config/email");
+const { computeDynamicTicketAi } = require("../services/ticketAiRuntime.service");
+
+const TICKET_REF_REGEX = /^TT-[1-9]\d{0,6}$/;
+
+const hideAiMetricsForClosedTicket = (ticketDoc) => {
+  const ticket = ticketDoc?.toObject ? ticketDoc.toObject() : { ...ticketDoc };
+
+  if (ticket.statut === "CLOTURE") {
+    delete ticket.aiScore;
+    delete ticket.priorite;
+  }
+
+  return ticket;
+};
+
+const findTicketByIdentifier = async (identifier) => {
+  const value = identifier?.toString().trim();
+
+  if (!value) {
+    return null;
+  }
+
+  if (mongoose.isValidObjectId(value)) {
+    return Ticket.findById(value);
+  }
+
+  if (TICKET_REF_REGEX.test(value)) {
+    return Ticket.findOne({ ticketRef: value });
+  }
+
+  return null;
+};
 
 // 🔹 Vérifier si la date de présence est aujourd'hui
 const estPresentAujourdhui = (user) => {
@@ -127,8 +160,8 @@ exports.assignerTicket = async (req, res) => {
       return res.status(403).json({ message: "Accès admin invalide" });
     }
 
-    // Vérifie que le ticket existe
-    const ticket = await Ticket.findById(ticketId);
+    // Vérifie que le ticket existe (_id MongoDB ou reference metier TT-x)
+    const ticket = await findTicketByIdentifier(ticketId);
     if (!ticket) return res.status(404).json({ message: "Ticket non trouvé" });
 
     if (!ticket.adminId || ticket.adminId.toString() !== adminId.toString()) {
@@ -201,40 +234,92 @@ exports.assignerTicket = async (req, res) => {
   }
 };
 
-// 🔹 Désactiver un technicien ou client (soft delete)
-exports.desactiverUtilisateur = async (req, res) => {
-  try {
-    const user = await Utilisateur.findById(req.params.id);
+// 🔹 Désactiver technicien (soft delete)
+exports.desactivertechnicien = async (req, res) => {
+  const session = await mongoose.startSession();
 
-    if (!user) {
+  try {
+    const result = {
+      nom: null,
+      ticketsRouverts: 0
+    };
+
+    await session.withTransaction(async () => {
+      const user = await Utilisateur.findById(req.params.id).session(session);
+
+      if (!user) {
+        throw new Error("USER_NOT_FOUND");
+      }
+
+      // 🔹 L'admin ne peut désactiver que des techniciens
+      if (user.role !== "TECHNICIEN") {
+        throw new Error("ROLE_NOT_ALLOWED");
+      }
+
+      // 🔹 Vérifier que le technicien appartient à cet admin
+      if (!user.creePar || user.creePar.toString() !== req.user.id.toString()) {
+        throw new Error("TECH_NOT_MANAGED_BY_ADMIN");
+      }
+
+      if (!user.isActive) {
+        throw new Error("TECH_ALREADY_DISABLED");
+      }
+
+      // 🔹 Réouvrir les tickets EN_COURS du technicien désactivé
+      const reopenResult = await Ticket.updateMany(
+        {
+          technicienId: user._id,
+          statut: "EN_COURS"
+        },
+        {
+          $set: {
+            statut: "OUVERT",
+            technicienId: null,
+            assignationDate: null
+          }
+        },
+        { session }
+      );
+
+      user.isActive = false;
+      user.estPresent = false;
+      user.datePresence = null;
+      user.refreshToken = null;
+      await user.save({ session });
+
+      result.nom = user.nom;
+      result.ticketsRouverts = reopenResult.modifiedCount ?? reopenResult.nModified ?? 0;
+    });
+
+    res.json({
+      message: `Technicien ${result.nom} désactivé avec succès`,
+      ticketsRouverts: result.ticketsRouverts
+    });
+  } catch (err) {
+    if (err.message === "USER_NOT_FOUND") {
       return res.status(404).json({ message: "Utilisateur introuvable" });
     }
 
-    // 🔹 L'admin ne peut désactiver que des techniciens
-    if (user.role !== "TECHNICIEN") {
+    if (err.message === "ROLE_NOT_ALLOWED") {
       return res.status(403).json({ message: "L'admin ne peut désactiver que des techniciens" });
     }
 
-    // 🔹 Vérifier que le technicien appartient à cet admin
-    if (!user.creePar || user.creePar.toString() !== req.user.id.toString()) {
+    if (err.message === "TECH_NOT_MANAGED_BY_ADMIN") {
       return res.status(403).json({ message: "Ce technicien n'est pas géré par cet admin" });
     }
 
-    if (!user.isActive) {
+    if (err.message === "TECH_ALREADY_DISABLED") {
       return res.status(400).json({ message: "Technicien déjà désactivé" });
     }
 
-    user.isActive = false;
-    await user.save();
-
-    res.json({ message: `Technicien ${user.nom} désactivé avec succès` });
-  } catch (err) {
     res.status(500).json({ message: err.message });
+  } finally {
+    await session.endSession();
   }
 };
 
-// 🔹 Réactiver un technicien ou client
-exports.reactiverUtilisateur = async (req, res) => {
+// 🔹 Réactiver technicien
+exports.reactivertechnicien = async (req, res) => {
   try {
     const user = await Utilisateur.findById(req.params.id);
 
@@ -349,17 +434,24 @@ exports.listerTechniciens = async (req, res) => {
       return res.status(404).json({ message: "Admin introuvable" });
     }
 
-    // Récupérer les techniciens créés par cet admin
-    const techniciens = await Utilisateur.find({
+    const includeInactive = req.query.includeInactive === "true";
+    const query = {
       role: "TECHNICIEN",
       creePar: admin._id,
-      isActive: true
-    }).select("-motDePasse -codeVerification -codeVerificationExpire -codeResetVerifie");
+    };
+
+    if (!includeInactive) {
+      query.isActive = true;
+    }
+
+    // Récupérer les techniciens créés par cet admin
+    const techniciens = await Utilisateur.find(query)
+      .select("-motDePasse -codeVerification -codeVerificationExpire -codeResetVerifie");
 
     // Ajouter le statut de présence (vérifier si datePresence = aujourd'hui)
     const result = techniciens.map(tech => {
       const techObj = tech.toObject();
-      techObj.presentAujourdhui = estPresentAujourdhui(tech);
+      techObj.presentAujourdhui = tech.isActive ? estPresentAujourdhui(tech) : false;
       return techObj;
     });
 
@@ -380,9 +472,9 @@ exports.listerTechniciens = async (req, res) => {
 exports.ticketsAdmin = async (req, res) => {
   try {
     const tickets = await Ticket.find({ adminId: req.user.id })
-      .populate("clientId", "nom email")
-      .populate("technicienId", "nom email")
-      .populate("adminId", "nom email");
+      .populate("clientId", "nom email photoUrl")
+      .populate("technicienId", "nom email photoUrl")
+      .populate("adminId", "nom email photoUrl");
 
     if (!tickets || tickets.length === 0) {
       return res.status(404).json({
@@ -390,7 +482,52 @@ exports.ticketsAdmin = async (req, res) => {
       });
     }
 
-    res.json(tickets);
+    const updates = [];
+
+    for (const ticket of tickets) {
+      if (ticket.statut === "CLOTURE") {
+        continue;
+      }
+
+      const dynamicAi = computeDynamicTicketAi({
+        typeProbleme: ticket.typeProbleme,
+        creationDate: ticket.creationDate,
+        tempsReponsePrevu: ticket.tempsReponsePrevu,
+        statut: ticket.statut,
+      });
+
+      if (!dynamicAi) {
+        continue;
+      }
+
+      const scoreChanged = ticket.aiScore !== dynamicAi.score;
+      const prioriteChanged = ticket.priorite !== dynamicAi.priorite;
+
+      if (!scoreChanged && !prioriteChanged) {
+        continue;
+      }
+
+      ticket.aiScore = dynamicAi.score;
+      ticket.priorite = dynamicAi.priorite;
+
+      updates.push({
+        updateOne: {
+          filter: { _id: ticket._id },
+          update: {
+            $set: {
+              aiScore: dynamicAi.score,
+              priorite: dynamicAi.priorite,
+            },
+          },
+        },
+      });
+    }
+
+    if (updates.length > 0) {
+      await Ticket.bulkWrite(updates);
+    }
+
+    res.json(tickets.map(hideAiMetricsForClosedTicket));
 
   } catch (err) {
     res.status(500).json({ message: err.message });

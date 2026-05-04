@@ -1,16 +1,86 @@
-# React + Vite
 
-This template provides a minimal setup to get React working in Vite with HMR and some ESLint rules.
+# Smart Fibre TT
 
-Currently, two official plugins are available:
+Frontend React + Vite + TypeScript pour la gestion des incidents fibre optique (multi-roles).
 
-- [@vitejs/plugin-react](https://github.com/vitejs/vite-plugin-react/blob/main/packages/plugin-react) uses [Babel](https://babeljs.io/) (or [oxc](https://oxc.rs) when used in [rolldown-vite](https://vite.dev/guide/rolldown)) for Fast Refresh
-- [@vitejs/plugin-react-swc](https://github.com/vitejs/vite-plugin-react/blob/main/packages/plugin-react-swc) uses [SWC](https://swc.rs/) for Fast Refresh
+## Etat actuel
 
-## React Compiler
+- Gestion par roles: Client, Admin, Technicien, Superadmin.
+- Navigation et ecrans metier bases sur React Router.
+- Cartographie integree (Leaflet) pour la localisation des tickets/zone.
+- Flux connectes au backend reel:
+  - login
+  - inscription client
+  - verification email + renvoi code + changement email
+  - creation ticket client
+- D'autres ecrans restent principalement des maquettes visuelles et doivent etre relies endpoint par endpoint.
 
-The React Compiler is not enabled on this template because of its impact on dev & build performances. To add it, see [this documentation](https://react.dev/learn/react-compiler/installation).
+## Stack technique
 
-## Expanding the ESLint configuration
+- React 18
+- TypeScript
+- React Router
+- Vite
+- Lucide React
+- Leaflet
 
-If you are developing a production application, we recommend using TypeScript with type-aware lint rules enabled. Check out the [TS template](https://github.com/vitejs/vite/tree/main/packages/create-vite/template-react-ts) for information on how to integrate TypeScript and [`typescript-eslint`](https://typescript-eslint.io) in your project.
+## Prerequis
+
+- Node.js 18+ recommande
+- npm 9+ recommande
+
+## Installation
+
+```bash
+npm install
+```
+
+## Lancement en developpement
+
+```bash
+npm run dev
+```
+
+## Build production
+
+```bash
+npm run build
+```
+
+## Scripts disponibles
+
+- `npm run dev` : demarrer Vite en mode developpement
+- `npm run build` : generer le bundle de production
+
+## Configuration environnement
+
+Option 1 (recommandee): utiliser le proxy Vite en local (deja configure sur `/api` vers `http://localhost:5000`).
+
+Option 2: definir un backend explicite via `.env` a la racine frontend:
+
+```env
+VITE_API_BASE_URL=http://localhost:5000
+VITE_RECAPTCHA_SITE_KEY=votre_cle_site_recaptcha_v2
+```
+
+Un fichier modele est disponible: `.env.example`.
+
+## Routes principales
+
+- `/` : landing page
+- `/auth/*` : authentification
+- `/client/*` : espace client
+- `/admin/*` : espace admin
+- `/tech/*` : espace technicien
+- `/superadmin/*` : espace superadmin
+- `/legal/*` : pages legales
+
+## Structure projet (frontend)
+
+- `src/app/routes.ts` : declaration des routes
+- `src/app/pages` : pages par role et pages auth/legal
+- `src/app/components` : layout et composants partages
+- `src/app/context/ProfileContext.tsx` : etat profil global (photo incluse)
+- `src/app/utils/profileApi.ts` : appels API profil/photo
+- `src/styles` : styles globaux
+  

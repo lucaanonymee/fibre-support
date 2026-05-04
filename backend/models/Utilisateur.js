@@ -64,6 +64,13 @@ const utilisateurSchema = new mongoose.Schema({
     required: function() { return this.role === "CLIENT"; }
   },
 
+  // 🔹 URL publique de la photo de profil
+  photoUrl: {
+    type: String,
+    trim: true,
+    default: null
+  },
+
   // 🔹 Vérification email
   emailVerifie: {
     type: Boolean,
@@ -84,6 +91,17 @@ const utilisateurSchema = new mongoose.Schema({
   codeResetVerifie: {
     type: Boolean,
     default: false
+  },
+
+  // 🔹 Protection brute force sur la saisie des codes email/reset
+  tentativesCodeInvalide: {
+    type: Number,
+    default: 0
+  },
+
+  blocageCodeJusqua: {
+    type: Date,
+    default: null
   },
 
   // 🔹 Présence technicien (réinitialisée chaque jour)
@@ -113,19 +131,16 @@ const utilisateurSchema = new mongoose.Schema({
 
 
 // Le numéro de téléphone est réservé au rôle CLIENT.
-utilisateurSchema.pre("validate", function(next) {
+utilisateurSchema.pre("validate", function() {
   if (this.role !== "CLIENT") {
     this.numTelephone = undefined;
   }
-  next();
 });
 // 🔹 Supprimer zoneIntervention pour les clients (un client peut avoir plusieurs SN dans différentes zones)
-utilisateurSchema.pre("save", function(next) {
+utilisateurSchema.pre("save", function() {
   if (this.role === "CLIENT") {
     this.zoneIntervention = undefined;
   }
-
-  next();
 });
 
 // Créer le model

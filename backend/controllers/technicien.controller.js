@@ -1,20 +1,54 @@
+const mongoose = require("mongoose");
 const Ticket = require("../models/Ticket");
 const { envoyerEmailClotureTicket } = require("../config/email");
+
+const TICKET_REF_REGEX = /^TT-[1-9]\d{0,6}$/;
+
+const hideAiMetricsForTechnicien = (ticketDoc) => {
+  const ticket = ticketDoc?.toObject ? ticketDoc.toObject() : { ...ticketDoc };
+
+  delete ticket.aiScore;
+  delete ticket.priorite;
+  delete ticket.tempsReponsePrevu;
+
+  return ticket;
+};
+
+const findTicketByIdentifier = async (identifier) => {
+  const value = identifier?.toString().trim();
+
+  if (!value) {
+    return null;
+  }
+
+  if (mongoose.isValidObjectId(value)) {
+    return Ticket.findById(value);
+  }
+
+  if (TICKET_REF_REGEX.test(value)) {
+    return Ticket.findOne({ ticketRef: value });
+  }
+
+  return null;
+};
 
 // Voir tickets assignés à un technicien
 exports.ticketsAssignes = async (req, res) => {
   try {
     // 🔹 On cherche par champ correct "technicienId"
     const tickets = await Ticket.find({ technicienId: req.user.id })
-      .populate("clientId", "nom email numTelephone")  // infos client + téléphone
-      .populate("technicienId", "nom email")  // infos technicien
-      .populate("adminId", "nom email");     // infos admin qui a assigné
+      .populate("clientId", "nom email numTelephone photoUrl")  // infos client + téléphone
+      .populate("technicienId", "nom email photoUrl")  // infos technicien
+      .populate("adminId", "nom email photoUrl")     // infos admin qui a assigné
+      .sort({ assignationDate: 1, creationDate: 1 }); // ordre d'assignation admin
 
     if (!tickets || tickets.length === 0) {
       return res.status(404).json({ message: "Aucun ticket assigné à ce technicien" });
     }
 
-    res.json(tickets);
+    const ticketsSanitizes = tickets.map(hideAiMetricsForTechnicien);
+
+    res.json(ticketsSanitizes);
   } catch (err) {
     res.status(500).json({ message: err.message });
   }
@@ -23,11 +57,14 @@ exports.ticketsAssignes = async (req, res) => {
 // Mettre à jour statut d’un ticket
 exports.mettreAJourTicket = async (req, res) => {
   try {
-    // 🔹 Chercher le ticket par ID et peupler client et technicien
-    const ticket = await Ticket.findById(req.params.id)
-      .populate("clientId", "nom email")
-      .populate("technicienId", "nom email")
-      .populate("adminId", "nom email");
+    // 🔹 Chercher le ticket par ID (_id MongoDB ou reference metier TT-x)
+    const ticket = await findTicketByIdentifier(req.params.id);
+
+    if (ticket) {
+      await ticket.populate("clientId", "nom email photoUrl");
+      await ticket.populate("technicienId", "nom email photoUrl");
+      await ticket.populate("adminId", "nom email photoUrl");
+    }
 
     if (!ticket) {
       return res.status(404).json({ message: "Ticket introuvable" });
@@ -62,6 +99,8 @@ exports.mettreAJourTicket = async (req, res) => {
       // Clôturer le ticket
       ticket.statut = "CLOTURE";
       ticket.clotureDate = new Date();
+      ticket.aiScore = undefined;
+      ticket.priorite = undefined;
       await ticket.save();
 
       // 🔹 Envoyer un email de notification au client
@@ -76,7 +115,7 @@ exports.mettreAJourTicket = async (req, res) => {
       
       return res.json({
         message: "Ticket clôturé avec succès",
-        ticket
+        ticket: hideAiMetricsForTechnicien(ticket)
       });
     }
 
@@ -100,9 +139,9 @@ exports.historiqueBySN = async (req, res) => {
     }
 
     const tickets = await Ticket.find({ sn: sn })
-      .populate("clientId", "nom email numTelephone")
-      .populate("technicienId", "nom email")
-      .populate("adminId", "nom email")
+      .populate("clientId", "nom email numTelephone photoUrl")
+      .populate("technicienId", "nom email photoUrl")
+      .populate("adminId", "nom email photoUrl")
       .sort({ creationDate: -1 }); // du plus récent au plus ancien
 
     if (!tickets || tickets.length === 0) {
@@ -112,7 +151,7 @@ exports.historiqueBySN = async (req, res) => {
     res.json({
       sn,
       totalTickets: tickets.length,
-      tickets
+      tickets: tickets.map(hideAiMetricsForTechnicien)
     });
   } catch (err) {
     res.status(500).json({ message: err.message });

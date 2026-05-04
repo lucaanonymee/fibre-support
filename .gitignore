@@ -6,3 +6,4 @@ frontend/node_modules/
 # Fichiers secrets
 .env
 backend/.env
+frontend/.env

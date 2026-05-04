@@ -3,7 +3,7 @@ const mongoose = require("mongoose");
 
 const connectDB = async () => {
   try {
-    await mongoose.connect(process.env.MONGO_URI || "mongodb://127.0.0.1:27017/test_db");
+    await mongoose.connect(process.env.MONGO_URI || "mongodb://127.0.0.1:27017/pfe?replicaSet=rs0");
     console.log("MongoDB connecté ✅");
   } catch (err) {
     console.error("Erreur de connexion MongoDB :", err);
