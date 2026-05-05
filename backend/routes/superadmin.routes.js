@@ -13,8 +13,8 @@ router.post("/api/superadmin/admin", auth, superadmin.creerAdmin);
 // 🔹 Lister tous les utilisateurs (ADMIN / CLIENT / TECHNICIEN)
 router.get("/api/superadmin/utilisateurs", auth, superadmin.listerUtilisateurs);
 
-// 🔹 Journal des actions superadmin
-router.get("/api/superadmin/actions", auth, superadmin.listerActions);
+// 🔹 Resume global des tickets
+router.get("/api/superadmin/tickets/summary", auth, superadmin.ticketsSummary);
 
 // 🔹 Désactiver / Réactiver un utilisateur (hors SUPER_ADMIN)
 router.put("/api/superadmin/desactiver/:id", auth, superadmin.desactiverUtilisateur);

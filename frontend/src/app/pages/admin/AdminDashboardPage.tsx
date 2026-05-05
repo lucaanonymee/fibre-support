@@ -1,8 +1,6 @@
 import { useCallback, useEffect, useMemo, useState } from 'react';
 import { AlertTriangle, CheckCircle2, Clock3, Ticket, Users, Wrench } from 'lucide-react';
 import {
-  Area,
-  AreaChart,
   Bar,
   BarChart,
   CartesianGrid,
@@ -15,11 +13,10 @@ import {
   XAxis,
   YAxis,
 } from 'recharts';
-import { StatusBadge } from '../../components/StatusBadge';
 import { ChartTooltip } from '../../components/dashboard/ChartTooltip';
 import { DashboardPanel } from '../../components/dashboard/DashboardPanel';
 import { KpiCard } from '../../components/dashboard/KpiCard';
-import { formatDateFr, toPriorityLabel, toProblemTypeLabel, toTicketCategory } from '../../utils/backendMappers';
+import { toTicketCategory } from '../../utils/backendMappers';
 import { ApiError, apiRequest, getErrorMessage } from '../../utils/httpApi';
 
 type PeriodKey = '7j' | '30j' | '90j';
@@ -37,6 +34,7 @@ interface BackendAdminTicket {
   statut?: TicketStatus;
   priorite?: string;
   creationDate?: string;
+  assignationDate?: string;
   clientId?: BackendUserRef | null;
   technicienId?: BackendUserRef | null;
 }
@@ -47,38 +45,15 @@ interface BackendAdminTechnician {
   presentAujourdhui?: boolean;
 }
 
-interface TrendPoint {
+interface AssignmentPoint {
   label: string;
-  ouverts: number;
-  enCours: number;
-  clotures: number;
-}
-
-interface TicketTypePoint {
-  name: string;
-  total: number;
+  count: number;
 }
 
 interface ZoneSplitPoint {
   name: 'UGS' | 'ULS';
   value: number;
   color: string;
-}
-
-interface TechLoadPoint {
-  name: string;
-  tickets: number;
-  resolus: number;
-}
-
-interface TicketRow {
-  id: string;
-  client: string;
-  type: string;
-  priority: string | null;
-  status: TicketStatus;
-  zone: 'UGS' | 'ULS';
-  date: string;
 }
 
 interface StatusCounts {
@@ -93,10 +68,9 @@ const periodLabels: Record<PeriodKey, string> = {
   '90j': '90 derniers jours',
 };
 
-const monthLabels = ['Jan', 'Fev', 'Mar', 'Avr', 'Mai', 'Jun', 'Jul', 'Aou', 'Sep', 'Oct', 'Nov', 'Dec'];
-const weekdayLabels = ['Dim', 'Lun', 'Mar', 'Mer', 'Jeu', 'Ven', 'Sam'];
-const dayMs = 24 * 60 * 60 * 1000;
 const AUTO_REFRESH_MS = 30000;
+const dayMs = 24 * 60 * 60 * 1000;
+const pad = (value: number): string => value.toString().padStart(2, '0');
 
 const toDate = (value?: string): Date | null => {
   if (!value) {
@@ -119,6 +93,31 @@ const addDays = (date: Date, days: number): Date => {
   const next = new Date(date);
   next.setDate(next.getDate() + days);
   return next;
+};
+
+const toDayKey = (date: Date): string => `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())}`;
+
+const formatShortDate = (date: Date): string => `${pad(date.getDate())}/${pad(date.getMonth() + 1)}`;
+
+const formatFullDate = (date: Date): string => `${formatShortDate(date)}/${date.getFullYear()}`;
+
+const parseDateInput = (value: string): Date | null => {
+  if (!value) {
+    return null;
+  }
+
+  const parts = value.split('-').map((item) => Number(item));
+  if (parts.length !== 3 || parts.some((item) => Number.isNaN(item))) {
+    return null;
+  }
+
+  const [year, month, day] = parts;
+  const parsed = new Date(year, month - 1, day);
+  if (Number.isNaN(parsed.getTime())) {
+    return null;
+  }
+
+  return parsed;
 };
 
 const getPeriodDays = (period: PeriodKey): number => {
@@ -160,152 +159,10 @@ const countStatusesForRange = (tickets: BackendAdminTicket[], start: Date, end: 
   return counts;
 };
 
-const formatDelta = (current: number, previous: number): { label: string; positive: boolean } => {
-  if (previous <= 0) {
-    if (current <= 0) {
-      return { label: '0%', positive: true };
-    }
-    return { label: '+100%', positive: true };
-  }
-
-  const ratio = ((current - previous) / previous) * 100;
-  const rounded = Math.round(ratio);
-  const prefix = rounded > 0 ? '+' : '';
-
-  return {
-    label: `${prefix}${rounded}%`,
-    positive: rounded >= 0,
-  };
-};
-
-const buildTrendData = (period: PeriodKey, tickets: BackendAdminTicket[], start: Date): TrendPoint[] => {
-  if (period === '7j') {
-    const rows: TrendPoint[] = Array.from({ length: 7 }, (_, index) => {
-      const day = addDays(start, index);
-      return {
-        label: weekdayLabels[day.getDay()],
-        ouverts: 0,
-        enCours: 0,
-        clotures: 0,
-      };
-    });
-
-    tickets.forEach((ticket) => {
-      const createdAt = toDate(ticket.creationDate);
-      if (!createdAt) {
-        return;
-      }
-
-      const diff = Math.floor((startOfDay(createdAt).getTime() - start.getTime()) / dayMs);
-      if (diff < 0 || diff >= rows.length) {
-        return;
-      }
-
-      if (ticket.statut === 'OUVERT') {
-        rows[diff].ouverts += 1;
-      } else if (ticket.statut === 'EN_COURS') {
-        rows[diff].enCours += 1;
-      } else if (ticket.statut === 'CLOTURE') {
-        rows[diff].clotures += 1;
-      }
-    });
-
-    return rows;
-  }
-
-  if (period === '30j') {
-    const rows: TrendPoint[] = Array.from({ length: 4 }, (_, index) => ({
-      label: `S${index + 1}`,
-      ouverts: 0,
-      enCours: 0,
-      clotures: 0,
-    }));
-
-    tickets.forEach((ticket) => {
-      const createdAt = toDate(ticket.creationDate);
-      if (!createdAt) {
-        return;
-      }
-
-      const diff = Math.floor((startOfDay(createdAt).getTime() - start.getTime()) / dayMs);
-      if (diff < 0 || diff >= 30) {
-        return;
-      }
-
-      const index = diff < 7 ? 0 : diff < 14 ? 1 : diff < 21 ? 2 : 3;
-
-      if (ticket.statut === 'OUVERT') {
-        rows[index].ouverts += 1;
-      } else if (ticket.statut === 'EN_COURS') {
-        rows[index].enCours += 1;
-      } else if (ticket.statut === 'CLOTURE') {
-        rows[index].clotures += 1;
-      }
-    });
-
-    return rows;
-  }
-
-  const now = new Date();
-  const months = [2, 1, 0].map((offset) => {
-    const bucketDate = new Date(now.getFullYear(), now.getMonth() - offset, 1);
-    return {
-      key: `${bucketDate.getFullYear()}-${bucketDate.getMonth()}`,
-      label: monthLabels[bucketDate.getMonth()],
-    };
-  });
-
-  const indexByMonth = new Map(months.map((item, index) => [item.key, index]));
-
-  const rows: TrendPoint[] = months.map((item) => ({
-    label: item.label,
-    ouverts: 0,
-    enCours: 0,
-    clotures: 0,
-  }));
-
-  tickets.forEach((ticket) => {
-    const createdAt = toDate(ticket.creationDate);
-    if (!createdAt) {
-      return;
-    }
-
-    const key = `${createdAt.getFullYear()}-${createdAt.getMonth()}`;
-    const index = indexByMonth.get(key);
-    if (index === undefined) {
-      return;
-    }
-
-    if (ticket.statut === 'OUVERT') {
-      rows[index].ouverts += 1;
-    } else if (ticket.statut === 'EN_COURS') {
-      rows[index].enCours += 1;
-    } else if (ticket.statut === 'CLOTURE') {
-      rows[index].clotures += 1;
-    }
-  });
-
-  return rows;
-};
-
-const getTechnicianName = (value?: BackendUserRef | null): string => {
-  if (value?.nom && value.nom.trim().length > 0) {
-    return value.nom;
-  }
-  return 'Technicien inconnu';
-};
-
-const getClientName = (value?: BackendUserRef | null): string => {
-  if (value?.nom && value.nom.trim().length > 0) {
-    return value.nom;
-  }
-  return 'Client inconnu';
-};
-
 export default function AdminDashboardPage() {
   const [period, setPeriod] = useState<PeriodKey>('30j');
-  const [statusFilter, setStatusFilter] = useState<'TOUS' | TicketStatus>('TOUS');
-  const [search, setSearch] = useState('');
+  const [rangeStart, setRangeStart] = useState('');
+  const [rangeEnd, setRangeEnd] = useState('');
 
   const [tickets, setTickets] = useState<BackendAdminTicket[]>([]);
   const [technicians, setTechnicians] = useState<BackendAdminTechnician[]>([]);
@@ -362,17 +219,21 @@ export default function AdminDashboardPage() {
   }, [loadDashboardData]);
 
   const periodRange = useMemo(() => {
+    const startInput = parseDateInput(rangeStart);
+    const endInput = parseDateInput(rangeEnd);
+
+    if (startInput && endInput && startInput <= endInput) {
+      const start = startOfDay(startInput);
+      const end = endOfDay(endInput);
+      const days = Math.max(1, Math.ceil((end.getTime() - start.getTime()) / dayMs) + 1);
+      return { start, end, days, label: `${formatFullDate(start)} - ${formatFullDate(end)}` };
+    }
+
     const days = getPeriodDays(period);
     const end = endOfDay(new Date());
     const start = startOfDay(addDays(end, -(days - 1)));
-    return { start, end, days };
-  }, [period]);
-
-  const previousRange = useMemo(() => {
-    const end = new Date(periodRange.start.getTime() - 1);
-    const start = startOfDay(addDays(periodRange.start, -periodRange.days));
-    return { start, end };
-  }, [periodRange]);
+    return { start, end, days, label: periodLabels[period] };
+  }, [period, rangeEnd, rangeStart]);
 
   const periodTickets = useMemo(
     () => tickets.filter((ticket) => {
@@ -380,11 +241,6 @@ export default function AdminDashboardPage() {
       return createdAt ? isWithinRange(createdAt, periodRange.start, periodRange.end) : false;
     }),
     [periodRange.end, periodRange.start, tickets],
-  );
-
-  const trendData = useMemo(
-    () => buildTrendData(period, periodTickets, periodRange.start),
-    [period, periodRange.start, periodTickets],
   );
 
   const statusTotals = useMemo(() => {
@@ -396,25 +252,6 @@ export default function AdminDashboardPage() {
       { name: 'Clotures', key: 'CLOTURE', value: totals.clotures, color: '#4caf50' },
     ];
   }, [periodRange.end, periodRange.start, periodTickets]);
-
-  const previousTotals = useMemo(
-    () => countStatusesForRange(tickets, previousRange.start, previousRange.end),
-    [previousRange.end, previousRange.start, tickets],
-  );
-
-  const ticketTypes = useMemo(() => {
-    const countByType = new Map<string, number>();
-
-    periodTickets.forEach((ticket) => {
-      const label = toProblemTypeLabel(ticket.typeProbleme);
-      countByType.set(label, (countByType.get(label) ?? 0) + 1);
-    });
-
-    return Array.from(countByType.entries())
-      .map(([name, total]) => ({ name, total }))
-      .sort((a, b) => b.total - a.total)
-      .slice(0, 6) satisfies TicketTypePoint[];
-  }, [periodTickets]);
 
   const zoneSplit = useMemo(() => {
     let ugs = 0;
@@ -434,127 +271,49 @@ export default function AdminDashboardPage() {
     ] satisfies ZoneSplitPoint[];
   }, [periodTickets]);
 
-  const technicianLoad = useMemo(() => {
-    const map = new Map<string, TechLoadPoint>();
-
-    technicians.forEach((tech) => {
-      const key = tech._id;
-      const name = tech.nom && tech.nom.trim().length > 0 ? tech.nom : `Technicien ${key.slice(-4).toUpperCase()}`;
-
-      map.set(key, {
-        name,
-        tickets: 0,
-        resolus: 0,
-      });
+  const assignmentSeries = useMemo(() => {
+    const rows: AssignmentPoint[] = Array.from({ length: periodRange.days }, (_, index) => {
+      const day = addDays(periodRange.start, index);
+      return {
+        label: formatShortDate(day),
+        count: 0,
+      };
     });
 
-    periodTickets.forEach((ticket) => {
-      if (!ticket.technicienId) {
+    const indexByKey = new Map<string, number>(
+      rows.map((_, index) => [toDayKey(addDays(periodRange.start, index)), index]),
+    );
+
+    tickets.forEach((ticket) => {
+      const assignedAt = toDate(ticket.assignationDate);
+      if (!assignedAt || !isWithinRange(assignedAt, periodRange.start, periodRange.end)) {
         return;
       }
 
-      const key = ticket.technicienId._id || `nom:${(ticket.technicienId.nom || 'inconnu').toLowerCase()}`;
-      const name = getTechnicianName(ticket.technicienId);
-      const current = map.get(key) ?? { name, tickets: 0, resolus: 0 };
-
-      if (ticket.statut === 'CLOTURE') {
-        current.resolus += 1;
-      } else {
-        current.tickets += 1;
+      const index = indexByKey.get(toDayKey(assignedAt));
+      if (index === undefined) {
+        return;
       }
 
-      map.set(key, current);
+      rows[index].count += 1;
     });
 
-    const sorted = Array.from(map.values()).sort((a, b) => {
-      if (b.tickets !== a.tickets) {
-        return b.tickets - a.tickets;
-      }
-      if (b.resolus !== a.resolus) {
-        return b.resolus - a.resolus;
-      }
-      return a.name.localeCompare(b.name, 'fr');
-    });
-
-    const withActivity = sorted.filter((item) => item.tickets > 0 || item.resolus > 0);
-    return (withActivity.length > 0 ? withActivity : sorted).slice(0, 8);
-  }, [periodTickets, technicians]);
+    return rows;
+  }, [periodRange.days, periodRange.end, periodRange.start, tickets]);
 
   const kpis = useMemo(() => {
     const ouverts = statusTotals.find((item) => item.key === 'OUVERT')?.value ?? 0;
     const enCours = statusTotals.find((item) => item.key === 'EN_COURS')?.value ?? 0;
     const clotures = statusTotals.find((item) => item.key === 'CLOTURE')?.value ?? 0;
-
-    const total = ouverts + enCours + clotures;
-    const resolutionRate = total > 0 ? Math.round((clotures / total) * 100) : 0;
-
-    const presentTechs = technicians.filter((tech) => tech.presentAujourdhui).length;
-    let activeTechs = technicianLoad.filter((item) => item.tickets > 0).length;
-    if (activeTechs === 0) {
-      activeTechs = presentTechs;
-    }
+    const activeTechs = technicians.length;
 
     return {
       ouverts,
       enCours,
       clotures,
-      resolutionRate,
       activeTechs,
-      presentTechs,
-      totalTechs: technicians.length,
     };
-  }, [statusTotals, technicianLoad, technicians]);
-
-  const deltas = useMemo(() => {
-    const openDelta = formatDelta(kpis.ouverts, previousTotals.ouverts);
-    const progressDelta = formatDelta(kpis.enCours, previousTotals.enCours);
-    const closedDelta = formatDelta(kpis.clotures, previousTotals.clotures);
-
-    return {
-      open: openDelta.label,
-      openPositive: kpis.ouverts <= previousTotals.ouverts,
-      progress: progressDelta.label,
-      progressPositive: kpis.enCours <= previousTotals.enCours,
-      closed: closedDelta.label,
-      closedPositive: closedDelta.positive,
-      techs: kpis.totalTechs > 0
-        ? `${kpis.presentTechs} presents (total ${kpis.totalTechs})`
-        : 'Aucun technicien',
-    };
-  }, [kpis, previousTotals]);
-
-  const ticketRows = useMemo(() => {
-    const sorted = [...periodTickets].sort((a, b) => {
-      const aTime = toDate(a.creationDate)?.getTime() ?? 0;
-      const bTime = toDate(b.creationDate)?.getTime() ?? 0;
-      return bTime - aTime;
-    });
-
-    return sorted.map((ticket) => ({
-      id: ticket.ticketRef || ticket._id,
-      client: getClientName(ticket.clientId),
-      type: toProblemTypeLabel(ticket.typeProbleme),
-      priority: ticket.statut === 'CLOTURE' ? null : toPriorityLabel(ticket.priorite),
-      status: ticket.statut || 'OUVERT',
-      zone: toTicketCategory(ticket.typeProbleme),
-      date: formatDateFr(ticket.creationDate),
-    })) satisfies TicketRow[];
-  }, [periodTickets]);
-
-  const filteredTickets = useMemo(() => {
-    const needle = search.trim().toLowerCase();
-
-    return ticketRows.filter((ticket) => {
-      const statusMatch = statusFilter === 'TOUS' || ticket.status === statusFilter;
-      const searchMatch =
-        needle.length === 0
-        || ticket.id.toLowerCase().includes(needle)
-        || ticket.client.toLowerCase().includes(needle)
-        || ticket.type.toLowerCase().includes(needle);
-
-      return statusMatch && searchMatch;
-    });
-  }, [search, statusFilter, ticketRows]);
+  }, [statusTotals, technicians.length]);
 
   return (
     <div>
@@ -594,9 +353,10 @@ export default function AdminDashboardPage() {
             <option value="90j">90 jours</option>
           </select>
 
-          <select
-            value={statusFilter}
-            onChange={(event) => setStatusFilter(event.target.value as 'TOUS' | TicketStatus)}
+          <input
+            type="date"
+            value={rangeStart}
+            onChange={(event) => setRangeStart(event.target.value)}
             style={{
               padding: '9px 12px',
               borderRadius: 8,
@@ -606,17 +366,12 @@ export default function AdminDashboardPage() {
               fontSize: 13,
               color: '#333',
             }}
-          >
-            <option value="TOUS">Tous statuts</option>
-            <option value="OUVERT">Ouvert</option>
-            <option value="EN_COURS">En cours</option>
-            <option value="CLOTURE">Cloture</option>
-          </select>
+          />
 
           <input
-            value={search}
-            onChange={(event) => setSearch(event.target.value)}
-            placeholder="Rechercher ticket/client"
+            type="date"
+            value={rangeEnd}
+            onChange={(event) => setRangeEnd(event.target.value)}
             style={{
               padding: '9px 12px',
               borderRadius: 8,
@@ -625,7 +380,6 @@ export default function AdminDashboardPage() {
               fontFamily: 'inherit',
               fontSize: 13,
               color: '#333',
-              minWidth: 190,
             }}
           />
         </div>
@@ -666,7 +420,7 @@ export default function AdminDashboardPage() {
       ) : null}
 
       <p style={{ margin: '0 0 16px', color: '#888', fontSize: 12 }}>
-        Periode active: {periodLabels[period]}
+        Periode active: {periodRange.label}
       </p>
 
       <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(220px, 1fr))', gap: 16, marginBottom: 20 }}>
@@ -676,8 +430,6 @@ export default function AdminDashboardPage() {
           icon={Ticket}
           color="#f44336"
           bg="#ffebee"
-          delta={deltas.open}
-          deltaPositive={deltas.openPositive}
         />
         <KpiCard
           label="En cours"
@@ -685,8 +437,6 @@ export default function AdminDashboardPage() {
           icon={Clock3}
           color="#ff9800"
           bg="#fff3e0"
-          delta={deltas.progress}
-          deltaPositive={deltas.progressPositive}
         />
         <KpiCard
           label="Clotures"
@@ -694,8 +444,6 @@ export default function AdminDashboardPage() {
           icon={CheckCircle2}
           color="#4caf50"
           bg="#e8f5e9"
-          delta={deltas.closed}
-          deltaPositive={deltas.closedPositive}
         />
         <KpiCard
           label="Techniciens actifs"
@@ -703,65 +451,60 @@ export default function AdminDashboardPage() {
           icon={Users}
           color="#1a237e"
           bg="#e8eaf6"
-          delta={deltas.techs}
         />
       </div>
 
       <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(330px, 1fr))', gap: 20 }}>
-        <DashboardPanel title="Tendance des tickets" subtitle="Ouverts, en cours et clotures" icon={<Ticket size={16} color="#1a237e" />}>
-          <div style={{ width: '100%', height: 260 }}>
-            <ResponsiveContainer>
-              <AreaChart data={trendData} margin={{ top: 10, right: 8, left: -16, bottom: 0 }}>
-                <defs>
-                  <linearGradient id="openedFill" x1="0" y1="0" x2="0" y2="1">
-                    <stop offset="5%" stopColor="#f44336" stopOpacity={0.28} />
-                    <stop offset="95%" stopColor="#f44336" stopOpacity={0.02} />
-                  </linearGradient>
-                  <linearGradient id="progressFill" x1="0" y1="0" x2="0" y2="1">
-                    <stop offset="5%" stopColor="#ff9800" stopOpacity={0.25} />
-                    <stop offset="95%" stopColor="#ff9800" stopOpacity={0.02} />
-                  </linearGradient>
-                  <linearGradient id="closedFill" x1="0" y1="0" x2="0" y2="1">
-                    <stop offset="5%" stopColor="#4caf50" stopOpacity={0.25} />
-                    <stop offset="95%" stopColor="#4caf50" stopOpacity={0.02} />
-                  </linearGradient>
-                </defs>
-                <CartesianGrid strokeDasharray="3 3" stroke="#eef2f6" />
-                <XAxis dataKey="label" tick={{ fill: '#666', fontSize: 12 }} axisLine={false} tickLine={false} />
-                <YAxis tick={{ fill: '#666', fontSize: 12 }} axisLine={false} tickLine={false} />
-                <Tooltip content={<ChartTooltip />} />
-                <Legend wrapperStyle={{ fontSize: 12 }} />
-                <Area type="monotone" dataKey="ouverts" name="Ouverts" stroke="#f44336" fill="url(#openedFill)" strokeWidth={2} />
-                <Area type="monotone" dataKey="enCours" name="En cours" stroke="#ff9800" fill="url(#progressFill)" strokeWidth={2} />
-                <Area type="monotone" dataKey="clotures" name="Clotures" stroke="#4caf50" fill="url(#closedFill)" strokeWidth={2} />
-              </AreaChart>
-            </ResponsiveContainer>
-          </div>
-        </DashboardPanel>
-
         <DashboardPanel
           title="Tickets par statut"
-          subtitle={`Taux de resolution: ${kpis.resolutionRate}%`}
+          subtitle="Repartition des tickets"
           icon={<AlertTriangle size={16} color="#ff9800" />}
         >
           <div style={{ width: '100%', height: 260 }}>
             <ResponsiveContainer>
-              <BarChart data={statusTotals} margin={{ top: 8, right: 8, left: -8, bottom: 0 }}>
-                <CartesianGrid strokeDasharray="3 3" stroke="#eef2f6" />
-                <XAxis dataKey="name" tick={{ fill: '#666', fontSize: 12 }} axisLine={false} tickLine={false} />
-                <YAxis tick={{ fill: '#666', fontSize: 12 }} axisLine={false} tickLine={false} />
-                <Tooltip content={<ChartTooltip />} />
-                <Bar dataKey="value" name="Tickets" radius={[6, 6, 0, 0]}>
+              <PieChart>
+                <Pie
+                  data={statusTotals}
+                  dataKey="value"
+                  nameKey="name"
+                  cx="50%"
+                  cy="50%"
+                  innerRadius={54}
+                  outerRadius={86}
+                  paddingAngle={2}
+                >
                   {statusTotals.map((item) => (
                     <Cell key={item.key} fill={item.color} />
                   ))}
-                </Bar>
+                </Pie>
+                <Tooltip content={<ChartTooltip />} />
+                <Legend wrapperStyle={{ fontSize: 12 }} />
+              </PieChart>
+            </ResponsiveContainer>
+          </div>
+        </DashboardPanel>
+
+        <DashboardPanel title="Tickets assignes par jour" subtitle="Charge de travail" icon={<Ticket size={16} color="#1a237e" />}>
+          <div style={{ width: '100%', height: 260 }}>
+            <ResponsiveContainer>
+              <BarChart data={assignmentSeries} margin={{ top: 10, right: 8, left: -8, bottom: 0 }}>
+                <CartesianGrid strokeDasharray="3 3" stroke="#eef2f6" />
+                <XAxis
+                  dataKey="label"
+                  tick={{ fill: '#666', fontSize: 10 }}
+                  axisLine={false}
+                  tickLine={false}
+                  interval="preserveStartEnd"
+                />
+                <YAxis tick={{ fill: '#666', fontSize: 12 }} axisLine={false} tickLine={false} />
+                <Tooltip content={<ChartTooltip />} />
+                <Bar dataKey="count" name="Assignes" fill="#1a237e" radius={[6, 6, 0, 0]} />
               </BarChart>
             </ResponsiveContainer>
           </div>
         </DashboardPanel>
 
-        <DashboardPanel title="Repartition UGS / ULS" subtitle="Volume de tickets par zone" icon={<Wrench size={16} color="#3f51b5" />}>
+        <DashboardPanel title="Repartition UGS / ULS" subtitle="Nombre de tickets" icon={<Wrench size={16} color="#3f51b5" />}>
           <div style={{ width: '100%', height: 260 }}>
             <ResponsiveContainer>
               <PieChart>
@@ -785,91 +528,10 @@ export default function AdminDashboardPage() {
             </ResponsiveContainer>
           </div>
         </DashboardPanel>
-
-        <DashboardPanel title="Charge des techniciens" subtitle="Tickets actifs vs resolus" icon={<Users size={16} color="#1a237e" />}>
-          <div style={{ width: '100%', height: 260 }}>
-            <ResponsiveContainer>
-              <BarChart data={technicianLoad} margin={{ top: 8, right: 8, left: -8, bottom: 0 }}>
-                <CartesianGrid strokeDasharray="3 3" stroke="#eef2f6" />
-                <XAxis dataKey="name" tick={{ fill: '#666', fontSize: 11 }} axisLine={false} tickLine={false} />
-                <YAxis tick={{ fill: '#666', fontSize: 12 }} axisLine={false} tickLine={false} />
-                <Tooltip content={<ChartTooltip />} />
-                <Legend wrapperStyle={{ fontSize: 12 }} />
-                <Bar dataKey="tickets" name="Actifs" fill="#1a237e" radius={[4, 4, 0, 0]} />
-                <Bar dataKey="resolus" name="Resolus" fill="#66bb6a" radius={[4, 4, 0, 0]} />
-              </BarChart>
-            </ResponsiveContainer>
-          </div>
-        </DashboardPanel>
-      </div>
-
-      <div style={{ marginTop: 20 }}>
-        <DashboardPanel
-          title="Tickets recents"
-          subtitle={`${filteredTickets.length} ticket(s) affiche(s)`}
-          icon={<AlertTriangle size={16} color="#ff9800" />}
-        >
-          <div style={{ overflowX: 'auto' }}>
-            <table style={{ width: '100%', borderCollapse: 'collapse', minWidth: 760 }}>
-              <thead>
-                <tr style={{ background: '#f8faff' }}>
-                  {['Ticket', 'Client', 'Type', 'Priorite', 'Statut', 'Zone', 'Date'].map((header) => (
-                    <th
-                      key={header}
-                      style={{
-                        textAlign: 'left',
-                        padding: '10px 12px',
-                        borderBottom: '1px solid #e8ecf0',
-                        fontSize: 11,
-                        color: '#666',
-                        textTransform: 'uppercase',
-                        letterSpacing: 0.4,
-                      }}
-                    >
-                      {header}
-                    </th>
-                  ))}
-                </tr>
-              </thead>
-              <tbody>
-                {filteredTickets.map((ticket, index) => (
-                  <tr key={ticket.id} style={{ background: index % 2 === 0 ? 'white' : '#fafcff' }}>
-                    <td style={{ padding: '11px 12px', borderBottom: '1px solid #f1f3f5', fontWeight: 700, color: '#1a237e' }}>{ticket.id}</td>
-                    <td style={{ padding: '11px 12px', borderBottom: '1px solid #f1f3f5', color: '#333', fontSize: 13 }}>{ticket.client}</td>
-                    <td style={{ padding: '11px 12px', borderBottom: '1px solid #f1f3f5', color: '#555', fontSize: 13 }}>{ticket.type}</td>
-                    <td style={{ padding: '11px 12px', borderBottom: '1px solid #f1f3f5' }}>
-                      {ticket.priority ? <StatusBadge status={ticket.priority} /> : <span style={{ color: '#bbb', fontSize: 12 }}>—</span>}
-                    </td>
-                    <td style={{ padding: '11px 12px', borderBottom: '1px solid #f1f3f5' }}>
-                      <StatusBadge status={ticket.status} />
-                    </td>
-                    <td style={{ padding: '11px 12px', borderBottom: '1px solid #f1f3f5' }}>
-                      <StatusBadge status={ticket.zone} />
-                    </td>
-                    <td style={{ padding: '11px 12px', borderBottom: '1px solid #f1f3f5', color: '#888', fontSize: 12 }}>{ticket.date}</td>
-                  </tr>
-                ))}
-              </tbody>
-            </table>
-
-            {filteredTickets.length === 0 ? (
-              <div
-                style={{
-                  padding: '18px 12px',
-                  textAlign: 'center',
-                  color: '#888',
-                  fontSize: 13,
-                }}
-              >
-                Aucun ticket ne correspond aux filtres.
-              </div>
-            ) : null}
-          </div>
-        </DashboardPanel>
       </div>
 
       <div style={{ marginTop: 14, fontSize: 12, color: '#888' }}>
-        Donnees live backend: tickets admin, statut, repartition UGS/ULS et charge techniciens.
+        Donnees live backend: tickets admin, statuts, repartition UGS/ULS et assignations.
       </div>
     </div>
   );

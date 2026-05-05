@@ -1,15 +1,9 @@
 const mongoose = require("mongoose");
 const Utilisateur = require("../models/Utilisateur");
 const Ticket = require("../models/Ticket");
-const SuperAdminAction = require("../models/SuperAdminAction");
 const { envoyerEmailBienvenueCompte } = require("../config/email");
 
 const MANAGED_ROLES = ["ADMIN", "CLIENT", "TECHNICIEN"];
-const ACTION_TYPES = {
-  CREATION: "CREATION",
-  DESACTIVATION: "DESACTIVATION",
-  REACTIVATION: "REACTIVATION",
-};
 
 const validatePassword = (motDePasse) => {
   const regex = /^(?=.*[a-z])(?=.*[A-Z])(?=.*\d)(?=.*[@$!%*?&])[A-Za-z\d@$!%*?&]{8,}$/;
@@ -117,26 +111,6 @@ const getSafeUserSelect = () => {
 
 const getModifiedCount = (result) => result?.modifiedCount ?? result?.nModified ?? 0;
 
-const logSuperAdminAction = async ({ actorId, actionType, targetUser, session = null }) => {
-  if (!actorId || !targetUser) {
-    return;
-  }
-
-  const actionPayload = {
-    actorId,
-    actionType,
-    targetId: targetUser._id,
-    targetRole: targetUser.role,
-    targetName: targetUser.nom || "",
-  };
-
-  if (session) {
-    await SuperAdminAction.create([actionPayload], { session });
-    return;
-  }
-
-  await SuperAdminAction.create(actionPayload);
-};
 
 const assertActiveSuperAdmin = async (superAdminId, session = null) => {
   const query = Utilisateur.findById(superAdminId);
@@ -426,16 +400,6 @@ exports.creerAdmin = async (req, res) => {
       console.error("Erreur envoi email bienvenue admin:", emailErr.message);
     }
 
-    try {
-      await logSuperAdminAction({
-        actorId: superAdmin._id,
-        actionType: ACTION_TYPES.CREATION,
-        targetUser: admin,
-      });
-    } catch (logErr) {
-      console.error("Erreur journal action superadmin:", logErr.message);
-    }
-
     const adminResponse = {
       _id: admin._id,
       nom: admin.nom,
@@ -484,29 +448,45 @@ exports.listerUtilisateurs = async (req, res) => {
   }
 };
 
-exports.listerActions = async (req, res) => {
+
+exports.ticketsSummary = async (req, res) => {
   try {
     await assertActiveSuperAdmin(req.user.id);
 
-    const rawLimit = Number.parseInt(req.query.limit, 10);
-    const limit = Number.isFinite(rawLimit) ? Math.min(Math.max(rawLimit, 1), 200) : 100;
+    const summary = await Ticket.aggregate([
+      {
+        $group: {
+          _id: "$statut",
+          total: { $sum: 1 },
+        },
+      },
+    ]);
 
-    const actions = await SuperAdminAction.find({})
-      .select("_id actionType targetId targetRole targetName createdAt")
-      .sort({ createdAt: -1 })
-      .limit(limit);
+    const status = {
+      OUVERT: 0,
+      EN_COURS: 0,
+      CLOTURE: 0,
+    };
+
+    summary.forEach((item) => {
+      if (item && Object.prototype.hasOwnProperty.call(status, item._id)) {
+        status[item._id] = item.total;
+      }
+    });
+
+    const total = status.OUVERT + status.EN_COURS + status.CLOTURE;
 
     return res.json({
-      total: actions.length,
-      actions,
+      total,
+      status,
     });
   } catch (err) {
     if (err.message === "SUPER_ADMIN_FORBIDDEN") {
-      return res.status(403).json({ message: "Accès refusé" });
+      return res.status(403).json({ message: "Acces refuse" });
     }
 
     if (err.message === "SUPER_ADMIN_DISABLED") {
-      return res.status(403).json({ message: "Compte Super Admin désactivé" });
+      return res.status(403).json({ message: "Compte Super Admin desactive" });
     }
 
     return res.status(500).json({ message: err.message });
@@ -567,16 +547,6 @@ exports.desactiverUtilisateur = async (req, res) => {
       result.role = user.role;
       Object.assign(result, roleResult);
 
-      try {
-        await logSuperAdminAction({
-          actorId: req.user.id,
-          actionType: ACTION_TYPES.DESACTIVATION,
-          targetUser: user,
-          session,
-        });
-      } catch (logErr) {
-        console.error("Erreur journal action superadmin:", logErr.message);
-      }
     });
 
     const roleLabel = getRoleLabel(result.role);
@@ -673,16 +643,6 @@ exports.reactiverUtilisateur = async (req, res) => {
 
     user.isActive = true;
     await user.save();
-
-    try {
-      await logSuperAdminAction({
-        actorId: req.user.id,
-        actionType: ACTION_TYPES.REACTIVATION,
-        targetUser: user,
-      });
-    } catch (logErr) {
-      console.error("Erreur journal action superadmin:", logErr.message);
-    }
 
     const roleLabel = getRoleLabel(user.role);
 

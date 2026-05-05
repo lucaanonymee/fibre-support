@@ -1,15 +1,11 @@
 import { useEffect, useMemo, useState } from 'react';
-import { AlertTriangle, CheckCircle2, ShieldCheck, UserCheck, UserCog, Users } from 'lucide-react';
+import { AlertTriangle, Ticket, UserCheck, Users } from 'lucide-react';
 import {
-  Area,
-  AreaChart,
   Bar,
   BarChart,
   CartesianGrid,
   Cell,
   Legend,
-  Line,
-  LineChart,
   Pie,
   PieChart,
   ResponsiveContainer,
@@ -20,10 +16,10 @@ import {
 import { ChartTooltip } from '../../components/dashboard/ChartTooltip';
 import { DashboardPanel } from '../../components/dashboard/DashboardPanel';
 import { KpiCard } from '../../components/dashboard/KpiCard';
-import { formatDateFr } from '../../utils/backendMappers';
 import { apiRequest, getErrorMessage } from '../../utils/httpApi';
 
-type PeriodKey = '30j' | '90j' | '12m';
+type PeriodKey = '7j' | '30j' | '90j';
+type TicketStatus = 'OUVERT' | 'EN_COURS' | 'CLOTURE';
 
 interface BackendZoneIntervention {
   type?: 'Polygon';
@@ -45,17 +41,9 @@ interface ListUsersResponse {
   users?: BackendUser[];
 }
 
-interface BackendAction {
-  _id: string;
-  actionType?: 'CREATION' | 'DESACTIVATION' | 'REACTIVATION';
-  targetName?: string;
-  targetRole?: 'ADMIN' | 'CLIENT' | 'TECHNICIEN';
-  createdAt?: string;
-}
-
-interface ListActionsResponse {
+interface TicketsSummaryResponse {
   total?: number;
-  actions?: BackendAction[];
+  status?: Partial<Record<TicketStatus, number>>;
 }
 
 interface AdminRecord {
@@ -64,69 +52,30 @@ interface AdminRecord {
   email: string;
   active: boolean;
   createdAt: Date | null;
-  createdEpoch: number;
-  zonePoints: number;
-}
-
-interface TimeBucket {
-  label: string;
-  start: Date;
-  end: Date;
-}
-
-interface GovernancePoint {
-  label: string;
-  creations: number;
-  inactifs: number;
-  cumule: number;
+  zoneAreaKm2: number;
 }
 
 interface AdminLoadPoint {
   name: string;
-  zonePoints: number;
+  espace: number;
   anciennete: number;
 }
 
 interface AdminStatusPoint {
-  name: 'ACTIF' | 'INACTIF';
+  name: string;
   value: number;
   color: string;
 }
 
-interface ZoneHealthPoint {
-  label: string;
-  couverture: number;
-  geometrie: number;
-}
-
-interface EventRow {
-  id: string;
-  action: string;
-  target: string;
-  date: string;
-  createdEpoch: number;
-}
-
 const periodLabels: Record<PeriodKey, string> = {
+  '7j': '7 derniers jours',
   '30j': '30 derniers jours',
   '90j': '90 derniers jours',
-  '12m': '12 derniers mois',
 };
 
-const ROLE_LABELS: Record<string, string> = {
-  ADMIN: 'Admin',
-  CLIENT: 'Client',
-  TECHNICIEN: 'Technicien',
-};
-
-const ACTION_LABELS: Record<string, string> = {
-  CREATION: 'Creation',
-  DESACTIVATION: 'Desactivation',
-  REACTIVATION: 'Reactivation',
-};
-
-const monthLabels = ['Jan', 'Fev', 'Mar', 'Avr', 'Mai', 'Jun', 'Jul', 'Aou', 'Sep', 'Oct', 'Nov', 'Dec'];
 const dayMs = 24 * 60 * 60 * 1000;
+const pad = (value: number): string => value.toString().padStart(2, '0');
+const EARTH_RADIUS_METERS = 6371000;
 
 const toDate = (value?: string): Date | null => {
   if (!value) {
@@ -151,119 +100,95 @@ const addDays = (date: Date, days: number): Date => {
   return next;
 };
 
-const isWithinRange = (date: Date, start: Date, end: Date): boolean => date >= start && date <= end;
+const formatShortDate = (date: Date): string => `${pad(date.getDate())}/${pad(date.getMonth() + 1)}`;
+
+const formatFullDate = (date: Date): string => `${formatShortDate(date)}/${date.getFullYear()}`;
+
+const parseDateInput = (value: string): Date | null => {
+  if (!value) {
+    return null;
+  }
+
+  const parts = value.split('-').map((item) => Number(item));
+  if (parts.length !== 3 || parts.some((item) => Number.isNaN(item))) {
+    return null;
+  }
+
+  const [year, month, day] = parts;
+  const parsed = new Date(year, month - 1, day);
+  if (Number.isNaN(parsed.getTime())) {
+    return null;
+  }
+
+  return parsed;
+};
 
 const getPeriodDays = (period: PeriodKey): number => {
+  if (period === '7j') {
+    return 7;
+  }
   if (period === '30j') {
     return 30;
   }
-  if (period === '90j') {
-    return 90;
-  }
-  return 365;
+  return 90;
 };
 
-const getPolygonPointCount = (zone?: BackendZoneIntervention | null): number => {
+const isWithinRange = (date: Date, start: Date, end: Date): boolean => date >= start && date <= end;
+
+const toRadians = (value: number): number => (value * Math.PI) / 180;
+
+const roundTo = (value: number, decimals: number): number => {
+  const factor = 10 ** decimals;
+  return Math.round(value * factor) / factor;
+};
+
+const getPolygonAreaSquareMeters = (zone?: BackendZoneIntervention | null): number => {
   const ring = zone?.coordinates?.[0];
-  if (!Array.isArray(ring) || ring.length === 0) {
+  if (!Array.isArray(ring) || ring.length < 3) {
     return 0;
   }
 
   const first = ring[0];
   const last = ring[ring.length - 1];
-
-  const looksClosed = Array.isArray(first)
+  const isClosed = Array.isArray(first)
     && Array.isArray(last)
     && first.length >= 2
     && last.length >= 2
     && first[0] === last[0]
     && first[1] === last[1];
 
-  if (looksClosed) {
-    return Math.max(0, ring.length - 1);
+  const points = isClosed ? ring : [...ring, ring[0]];
+  const latAverage = points.reduce((sum, point) => sum + toRadians(point[1]), 0) / points.length;
+  const cosLat = Math.cos(latAverage);
+
+  let area = 0;
+  for (let i = 0; i < points.length - 1; i += 1) {
+    const [lng1, lat1] = points[i];
+    const [lng2, lat2] = points[i + 1];
+
+    const x1 = EARTH_RADIUS_METERS * toRadians(lng1) * cosLat;
+    const y1 = EARTH_RADIUS_METERS * toRadians(lat1);
+    const x2 = EARTH_RADIUS_METERS * toRadians(lng2) * cosLat;
+    const y2 = EARTH_RADIUS_METERS * toRadians(lat2);
+
+    area += x1 * y2 - x2 * y1;
   }
 
-  return ring.length;
+  return Math.abs(area) / 2;
 };
 
-const clampPercent = (value: number): number => Math.max(0, Math.min(100, Math.round(value)));
-
-const formatDelta = (current: number, previous: number): { label: string; positive: boolean } => {
-  if (previous <= 0) {
-    if (current <= 0) {
-      return { label: '0%', positive: true };
-    }
-    return { label: '+100%', positive: true };
-  }
-
-  const ratio = ((current - previous) / previous) * 100;
-  const rounded = Math.round(ratio);
-  const prefix = rounded > 0 ? '+' : '';
-
-  return {
-    label: `${prefix}${rounded}%`,
-    positive: rounded >= 0,
-  };
-};
-
-const computeCoverage = (admins: AdminRecord[]): number => {
-  if (admins.length === 0) {
-    return 0;
-  }
-
-  const validCount = admins.filter((admin) => admin.zonePoints >= 3).length;
-  return clampPercent((validCount / admins.length) * 100);
-};
-
-const computeGeometryScore = (admins: AdminRecord[]): number => {
-  if (admins.length === 0) {
-    return 0;
-  }
-
-  const total = admins.reduce((sum, admin) => {
-    const normalized = clampPercent((admin.zonePoints / 8) * 100);
-    return sum + normalized;
-  }, 0);
-
-  return clampPercent(total / admins.length);
-};
-
-const buildBuckets = (period: PeriodKey, start: Date, end: Date): TimeBucket[] => {
-  const bucketCount = period === '30j' ? 4 : period === '90j' ? 3 : 6;
-
-  const totalDays = Math.max(1, Math.ceil((end.getTime() - start.getTime()) / dayMs) + 1);
-  const baseSize = Math.floor(totalDays / bucketCount);
-  const remainder = totalDays % bucketCount;
-
-  const buckets: TimeBucket[] = [];
-  let cursor = start;
-
-  for (let index = 0; index < bucketCount; index += 1) {
-    const size = baseSize + (index < remainder ? 1 : 0);
-    const bucketStart = cursor;
-    const bucketEnd = index === bucketCount - 1 ? end : endOfDay(addDays(bucketStart, size - 1));
-
-    const label = period === '30j'
-      ? `S${index + 1}`
-      : monthLabels[bucketStart.getMonth()];
-
-    buckets.push({
-      label,
-      start: bucketStart,
-      end: bucketEnd,
-    });
-
-    cursor = startOfDay(addDays(bucketEnd, 1));
-  }
-
-  return buckets;
+const getPolygonAreaKm2 = (zone?: BackendZoneIntervention | null): number => {
+  const areaMeters = getPolygonAreaSquareMeters(zone);
+  return roundTo(areaMeters / 1_000_000, 2);
 };
 
 export default function SuperAdminDashboardPage() {
-  const [period, setPeriod] = useState<PeriodKey>('90j');
+  const [period, setPeriod] = useState<PeriodKey>('30j');
+  const [rangeStart, setRangeStart] = useState('');
+  const [rangeEnd, setRangeEnd] = useState('');
 
   const [rawUsers, setRawUsers] = useState<BackendUser[]>([]);
-  const [rawActions, setRawActions] = useState<BackendAction[]>([]);
+  const [ticketSummary, setTicketSummary] = useState<TicketsSummaryResponse | null>(null);
   const [loading, setLoading] = useState(true);
   const [fetchError, setFetchError] = useState<string | null>(null);
 
@@ -273,16 +198,16 @@ export default function SuperAdminDashboardPage() {
       setFetchError(null);
 
       try {
-        const [usersResponse, actionsResponse] = await Promise.all([
+        const [usersResponse, ticketsResponse] = await Promise.all([
           apiRequest<ListUsersResponse>('/api/superadmin/utilisateurs', { method: 'GET' }),
-          apiRequest<ListActionsResponse>('/api/superadmin/actions?limit=120', { method: 'GET' }),
+          apiRequest<TicketsSummaryResponse>('/api/superadmin/tickets/summary', { method: 'GET' }),
         ]);
 
         setRawUsers(usersResponse.users || []);
-        setRawActions(actionsResponse.actions || []);
+        setTicketSummary(ticketsResponse);
       } catch (error) {
         setRawUsers([]);
-        setRawActions([]);
+        setTicketSummary(null);
         setFetchError(getErrorMessage(error, 'Impossible de charger les indicateurs superadmin.'));
       } finally {
         setLoading(false);
@@ -292,75 +217,46 @@ export default function SuperAdminDashboardPage() {
     void loadDashboard();
   }, []);
 
+  const periodRange = useMemo(() => {
+    const startInput = parseDateInput(rangeStart);
+    const endInput = parseDateInput(rangeEnd);
+
+    if (startInput && endInput && startInput <= endInput) {
+      const start = startOfDay(startInput);
+      const end = endOfDay(endInput);
+      const days = Math.max(1, Math.ceil((end.getTime() - start.getTime()) / dayMs) + 1);
+      return { start, end, days, label: `${formatFullDate(start)} - ${formatFullDate(end)}` };
+    }
+
+    const days = getPeriodDays(period);
+    const end = endOfDay(new Date());
+    const start = startOfDay(addDays(end, -(days - 1)));
+    return { start, end, days, label: periodLabels[period] };
+  }, [period, rangeEnd, rangeStart]);
+
   const admins = useMemo(() => {
     return rawUsers
       .filter((user) => user.role === 'ADMIN')
       .map((admin) => {
-      const createdAt = toDate(admin.createdAt);
-      const createdEpoch = createdAt ? createdAt.getTime() : 0;
+        const createdAt = toDate(admin.createdAt);
 
-      return {
-        id: admin._id,
-        name: admin.nom && admin.nom.trim().length > 0 ? admin.nom : `Admin ${admin._id.slice(-4).toUpperCase()}`,
-        email: admin.email || '',
-        active: admin.isActive !== false,
-        createdAt,
-        createdEpoch,
-        zonePoints: getPolygonPointCount(admin.zoneIntervention),
-      } satisfies AdminRecord;
+        return {
+          id: admin._id,
+          name: admin.nom && admin.nom.trim().length > 0 ? admin.nom : `Admin ${admin._id.slice(-4).toUpperCase()}`,
+          email: admin.email || '',
+          active: admin.isActive !== false,
+          createdAt,
+          zoneAreaKm2: getPolygonAreaKm2(admin.zoneIntervention),
+        } satisfies AdminRecord;
       });
   }, [rawUsers]);
 
-  const periodRange = useMemo(() => {
-    const days = getPeriodDays(period);
-    const end = endOfDay(new Date());
-    const start = startOfDay(addDays(end, -(days - 1)));
-
-    return { start, end, days };
-  }, [period]);
-
-  const previousRange = useMemo(() => {
-    const end = new Date(periodRange.start.getTime() - 1);
-    const start = startOfDay(addDays(periodRange.start, -periodRange.days));
-
-    return { start, end };
-  }, [periodRange]);
-
-  const buckets = useMemo(
-    () => buildBuckets(period, periodRange.start, periodRange.end),
-    [period, periodRange.end, periodRange.start],
-  );
-
-  const adminsInPeriod = useMemo(
-    () => admins.filter((admin) => admin.createdAt && isWithinRange(admin.createdAt, periodRange.start, periodRange.end)),
-    [admins, periodRange.end, periodRange.start],
-  );
-
-  const adminsInPreviousPeriod = useMemo(
-    () => admins.filter((admin) => admin.createdAt && isWithinRange(admin.createdAt, previousRange.start, previousRange.end)),
-    [admins, previousRange.end, previousRange.start],
-  );
-
-  const governanceData = useMemo(() => {
-    const noDateAdmins = admins.filter((admin) => !admin.createdAt).length;
-
-    return buckets.map((bucket) => {
-      const createdInBucket = admins.filter((admin) => admin.createdAt && isWithinRange(admin.createdAt, bucket.start, bucket.end));
-      const cumulative = noDateAdmins + admins.filter((admin) => admin.createdAt && admin.createdAt <= bucket.end).length;
-
-      return {
-        label: bucket.label,
-        creations: createdInBucket.length,
-        inactifs: createdInBucket.filter((admin) => !admin.active).length,
-        cumule: cumulative,
-      } satisfies GovernancePoint;
-    });
-  }, [admins, buckets]);
-
-  const sourceForLoad = adminsInPeriod.length > 0 ? adminsInPeriod : admins;
+  const adminsInRange = useMemo(() => {
+    return admins.filter((admin) => admin.createdAt && isWithinRange(admin.createdAt, periodRange.start, periodRange.end));
+  }, [admins, periodRange.end, periodRange.start]);
 
   const adminLoad = useMemo(() => {
-    return [...sourceForLoad]
+    return [...adminsInRange]
       .map((admin) => {
         const ageDays = admin.createdAt
           ? Math.max(1, Math.floor((Date.now() - admin.createdAt.getTime()) / dayMs))
@@ -368,13 +264,13 @@ export default function SuperAdminDashboardPage() {
 
         return {
           name: admin.name,
-          zonePoints: admin.zonePoints,
+          espace: admin.zoneAreaKm2,
           anciennete: ageDays,
         } satisfies AdminLoadPoint;
       })
       .sort((a, b) => {
-        if (b.zonePoints !== a.zonePoints) {
-          return b.zonePoints - a.zonePoints;
+        if (b.espace !== a.espace) {
+          return b.espace - a.espace;
         }
         if (b.anciennete !== a.anciennete) {
           return b.anciennete - a.anciennete;
@@ -382,106 +278,48 @@ export default function SuperAdminDashboardPage() {
         return a.name.localeCompare(b.name, 'fr');
       })
       .slice(0, 8);
-  }, [sourceForLoad]);
+  }, [adminsInRange]);
 
   const adminStatus = useMemo(() => {
-    const active = admins.filter((admin) => admin.active).length;
-    const inactive = admins.length - active;
+    const active = adminsInRange.filter((admin) => admin.active).length;
+    const inactive = adminsInRange.length - active;
 
     return [
-      { name: 'ACTIF', value: active, color: '#43a047' },
-      { name: 'INACTIF', value: inactive, color: '#90a4ae' },
+      { name: 'Actifs', value: active, color: '#43a047' },
+      { name: 'Inactifs', value: inactive, color: '#90a4ae' },
     ] satisfies AdminStatusPoint[];
-  }, [admins]);
+  }, [adminsInRange]);
 
-  const zoneHealth = useMemo(() => {
-    const fallbackCoverage = computeCoverage(admins);
-    const fallbackGeometry = computeGeometryScore(admins);
-
-    let lastCoverage = fallbackCoverage;
-    let lastGeometry = fallbackGeometry;
-
-    return buckets.map((bucket) => {
-      const createdInBucket = admins.filter((admin) => admin.createdAt && isWithinRange(admin.createdAt, bucket.start, bucket.end));
-
-      if (createdInBucket.length === 0) {
-        return {
-          label: bucket.label,
-          couverture: lastCoverage,
-          geometrie: lastGeometry,
-        } satisfies ZoneHealthPoint;
-      }
-
-      const coverage = computeCoverage(createdInBucket);
-      const geometry = computeGeometryScore(createdInBucket);
-
-      lastCoverage = coverage;
-      lastGeometry = geometry;
-
-      return {
-        label: bucket.label,
-        couverture: coverage,
-        geometrie: geometry,
-      } satisfies ZoneHealthPoint;
-    });
-  }, [admins, buckets]);
-
-  const actionEvents = useMemo(() => {
-    return rawActions
-      .map((action) => {
-        const createdAt = toDate(action.createdAt);
-        const createdEpoch = createdAt ? createdAt.getTime() : 0;
-        const roleLabel = action.targetRole ? (ROLE_LABELS[action.targetRole] || 'Utilisateur') : 'Utilisateur';
-        const actionLabel = action.actionType ? (ACTION_LABELS[action.actionType] || 'Action') : 'Action';
-        const targetName = action.targetName && action.targetName.trim().length > 0
-          ? action.targetName
-          : `Utilisateur ${action._id.slice(-4).toUpperCase()}`;
-
-        return {
-          id: `EV-${action._id.slice(-6).toUpperCase()}`,
-          action: `${actionLabel} ${roleLabel.toLowerCase()}`,
-          target: targetName,
-          date: formatDateFr(createdAt),
-          createdEpoch,
-        } satisfies EventRow;
-      })
-      .sort((a, b) => b.createdEpoch - a.createdEpoch);
-  }, [rawActions]);
-
-  const currentCoverage = useMemo(
-    () => computeCoverage(adminsInPeriod.length > 0 ? adminsInPeriod : admins),
-    [admins, adminsInPeriod],
-  );
-
-  const previousCoverage = useMemo(
-    () => computeCoverage(adminsInPreviousPeriod),
-    [adminsInPreviousPeriod],
-  );
-
-  const kpis = useMemo(() => {
-    const totalAdmins = admins.length;
-    const activeAdmins = admins.filter((admin) => admin.active).length;
-    const pendingActions = admins.filter((admin) => !admin.active || admin.zonePoints < 3).length;
-    const avgCoverage = computeCoverage(admins);
-
-    const periodCreations = adminsInPeriod.length;
-    const previousCreations = adminsInPreviousPeriod.length;
-    const creationDelta = formatDelta(periodCreations, previousCreations);
-
-    const coverageDelta = formatDelta(currentCoverage, previousCoverage);
-
-    const activeRatio = totalAdmins > 0 ? clampPercent((activeAdmins / totalAdmins) * 100) : 0;
+  const ticketStatusTotals = useMemo(() => {
+    const status = ticketSummary?.status ?? {};
+    const ouverts = status.OUVERT ?? 0;
+    const enCours = status.EN_COURS ?? 0;
+    const clotures = status.CLOTURE ?? 0;
+    const total = ticketSummary?.total ?? ouverts + enCours + clotures;
 
     return {
-      totalAdmins,
-      activeAdmins,
-      pendingActions,
-      avgCoverage,
-      creationDelta,
-      coverageDelta,
-      activeRatio,
+      ouverts,
+      enCours,
+      clotures,
+      total,
     };
-  }, [admins, adminsInPeriod.length, adminsInPreviousPeriod.length, currentCoverage, previousCoverage]);
+  }, [ticketSummary]);
+
+  const ticketStatusChart = useMemo(() => {
+    return [
+      { name: 'Ouverts', key: 'OUVERT', value: ticketStatusTotals.ouverts, color: '#f44336' },
+      { name: 'En cours', key: 'EN_COURS', value: ticketStatusTotals.enCours, color: '#ff9800' },
+      { name: 'Clotures', key: 'CLOTURE', value: ticketStatusTotals.clotures, color: '#4caf50' },
+    ];
+  }, [ticketStatusTotals]);
+
+  const kpis = useMemo(() => {
+    return {
+      totalUsers: rawUsers.length,
+      totalAdmins: admins.length,
+      totalTickets: ticketStatusTotals.total,
+    };
+  }, [admins.length, rawUsers.length, ticketStatusTotals.total]);
 
   return (
     <div>
@@ -498,7 +336,7 @@ export default function SuperAdminDashboardPage() {
         <div>
           <h1 style={{ margin: '0 0 4px', fontSize: 22, fontWeight: 800, color: '#1a237e' }}>Dashboard SuperAdmin</h1>
           <p style={{ margin: 0, color: '#888', fontSize: 14 }}>
-            Vue globale admins, sante des zones et actions de gouvernance
+            Vue globale utilisateurs, admins et tickets
           </p>
         </div>
 
@@ -516,10 +354,40 @@ export default function SuperAdminDashboardPage() {
               color: '#333',
             }}
           >
+            <option value="7j">7 jours</option>
             <option value="30j">30 jours</option>
             <option value="90j">90 jours</option>
-            <option value="12m">12 mois</option>
           </select>
+
+          <input
+            type="date"
+            value={rangeStart}
+            onChange={(event) => setRangeStart(event.target.value)}
+            style={{
+              padding: '9px 12px',
+              borderRadius: 8,
+              border: '1px solid #dfe5eb',
+              background: 'white',
+              fontFamily: 'inherit',
+              fontSize: 13,
+              color: '#333',
+            }}
+          />
+
+          <input
+            type="date"
+            value={rangeEnd}
+            onChange={(event) => setRangeEnd(event.target.value)}
+            style={{
+              padding: '9px 12px',
+              borderRadius: 8,
+              border: '1px solid #dfe5eb',
+              background: 'white',
+              fontFamily: 'inherit',
+              fontSize: 13,
+              color: '#333',
+            }}
+          />
         </div>
       </div>
 
@@ -558,82 +426,53 @@ export default function SuperAdminDashboardPage() {
       ) : null}
 
       <p style={{ margin: '0 0 16px', color: '#888', fontSize: 12 }}>
-        Periode active: {periodLabels[period]}
+        Periode active: {periodRange.label}
       </p>
 
       <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(220px, 1fr))', gap: 16, marginBottom: 20 }}>
         <KpiCard
-          label="Administrateurs"
-          value={kpis.totalAdmins}
+          label="Utilisateurs"
+          value={kpis.totalUsers}
           icon={Users}
           color="#1a237e"
           bg="#e8eaf6"
-          delta={`${kpis.creationDelta.label} creations periode`}
-          deltaPositive={kpis.creationDelta.positive}
         />
         <KpiCard
-          label="Admins actifs"
-          value={kpis.activeAdmins}
+          label="Admins"
+          value={kpis.totalAdmins}
           icon={UserCheck}
           color="#2e7d32"
           bg="#e8f5e9"
-          delta={`${kpis.activeRatio}% actifs`}
         />
         <KpiCard
-          label="Actions critiques"
-          value={kpis.pendingActions}
-          icon={AlertTriangle}
+          label="Tickets"
+          value={kpis.totalTickets}
+          icon={Ticket}
           color="#ef6c00"
           bg="#fff3e0"
-          delta={kpis.pendingActions > 0 ? `${kpis.pendingActions} a traiter` : 'R.A.S'}
-          deltaPositive={kpis.pendingActions === 0}
-        />
-        <KpiCard
-          label="Couverture moyenne"
-          value={`${kpis.avgCoverage}%`}
-          icon={ShieldCheck}
-          color="#1565c0"
-          bg="#e3f2fd"
-          delta={`${kpis.coverageDelta.label} vs periode prec.`}
-          deltaPositive={kpis.coverageDelta.positive}
         />
       </div>
 
       <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(330px, 1fr))', gap: 20 }}>
-        <DashboardPanel title="Gouvernance admins" subtitle="Creations, inactifs et total cumule" icon={<UserCog size={16} color="#1a237e" />}>
+        <DashboardPanel title="Tickets globaux" subtitle="Ouverts, en cours, clotures" icon={<Ticket size={16} color="#ef6c00" />}>
           <div style={{ width: '100%', height: 260 }}>
             <ResponsiveContainer>
-              <LineChart data={governanceData} margin={{ top: 10, right: 8, left: -16, bottom: 0 }}>
+              <BarChart data={ticketStatusChart} margin={{ top: 8, right: 8, left: -8, bottom: 0 }}>
                 <CartesianGrid strokeDasharray="3 3" stroke="#eef2f6" />
-                <XAxis dataKey="label" tick={{ fill: '#666', fontSize: 12 }} axisLine={false} tickLine={false} />
+                <XAxis dataKey="name" tick={{ fill: '#666', fontSize: 12 }} axisLine={false} tickLine={false} />
                 <YAxis tick={{ fill: '#666', fontSize: 12 }} axisLine={false} tickLine={false} />
                 <Tooltip content={<ChartTooltip />} />
-                <Legend wrapperStyle={{ fontSize: 12 }} />
-                <Line type="monotone" dataKey="creations" name="Creations" stroke="#1565c0" strokeWidth={2.5} dot={{ r: 3 }} />
-                <Line type="monotone" dataKey="inactifs" name="Inactifs" stroke="#ef5350" strokeWidth={2.5} dot={{ r: 3 }} />
-                <Line type="monotone" dataKey="cumule" name="Total cumule" stroke="#7e57c2" strokeWidth={2.5} dot={{ r: 3 }} />
-              </LineChart>
-            </ResponsiveContainer>
-          </div>
-        </DashboardPanel>
-
-        <DashboardPanel title="Profil des administrateurs" subtitle="Points de zone et anciennete (jours)" icon={<Users size={16} color="#4a148c" />}>
-          <div style={{ width: '100%', height: 260 }}>
-            <ResponsiveContainer>
-              <BarChart data={adminLoad} margin={{ top: 8, right: 8, left: -8, bottom: 0 }}>
-                <CartesianGrid strokeDasharray="3 3" stroke="#eef2f6" />
-                <XAxis dataKey="name" tick={{ fill: '#666', fontSize: 11 }} axisLine={false} tickLine={false} />
-                <YAxis tick={{ fill: '#666', fontSize: 12 }} axisLine={false} tickLine={false} />
-                <Tooltip content={<ChartTooltip />} />
-                <Legend wrapperStyle={{ fontSize: 12 }} />
-                <Bar dataKey="zonePoints" name="Zone points" fill="#4a148c" radius={[4, 4, 0, 0]} />
-                <Bar dataKey="anciennete" name="Anciennete" fill="#8e24aa" radius={[4, 4, 0, 0]} />
+                <Bar dataKey="value" name="Tickets" radius={[6, 6, 0, 0]}>
+                  {ticketStatusChart.map((item) => (
+                    <Cell key={item.key} fill={item.color} />
+                  ))}
+                </Bar>
               </BarChart>
             </ResponsiveContainer>
           </div>
         </DashboardPanel>
 
-        <DashboardPanel title="Statut des administrateurs" subtitle="Actifs vs inactifs" icon={<UserCheck size={16} color="#43a047" />}>
+        <DashboardPanel title="Gestion des admins" subtitle="Actifs vs inactifs" icon={<UserCheck size={16} color="#43a047" />}>
           <div style={{ width: '100%', height: 260 }}>
             <ResponsiveContainer>
               <PieChart>
@@ -658,93 +497,25 @@ export default function SuperAdminDashboardPage() {
           </div>
         </DashboardPanel>
 
-        <DashboardPanel title="Qualite des zones" subtitle="Couverture polygones et score geometrie" icon={<CheckCircle2 size={16} color="#1565c0" />}>
+        <DashboardPanel title="Profil des administrateurs" subtitle="Espace couvert (km2) et anciennete (jours)" icon={<Users size={16} color="#4a148c" />}>
           <div style={{ width: '100%', height: 260 }}>
             <ResponsiveContainer>
-              <AreaChart data={zoneHealth} margin={{ top: 8, right: 8, left: -16, bottom: 0 }}>
-                <defs>
-                  <linearGradient id="coverageFill" x1="0" y1="0" x2="0" y2="1">
-                    <stop offset="5%" stopColor="#1565c0" stopOpacity={0.28} />
-                    <stop offset="95%" stopColor="#1565c0" stopOpacity={0.03} />
-                  </linearGradient>
-                  <linearGradient id="geometryFill" x1="0" y1="0" x2="0" y2="1">
-                    <stop offset="5%" stopColor="#42a5f5" stopOpacity={0.24} />
-                    <stop offset="95%" stopColor="#42a5f5" stopOpacity={0.03} />
-                  </linearGradient>
-                </defs>
+              <BarChart data={adminLoad} margin={{ top: 8, right: 8, left: -8, bottom: 0 }}>
                 <CartesianGrid strokeDasharray="3 3" stroke="#eef2f6" />
-                <XAxis dataKey="label" tick={{ fill: '#666', fontSize: 12 }} axisLine={false} tickLine={false} />
-                <YAxis domain={[0, 100]} tick={{ fill: '#666', fontSize: 12 }} axisLine={false} tickLine={false} />
-                <Tooltip content={<ChartTooltip valueFormatter={(value) => `${value}%`} />} />
+                <XAxis dataKey="name" tick={{ fill: '#666', fontSize: 11 }} axisLine={false} tickLine={false} />
+                <YAxis tick={{ fill: '#666', fontSize: 12 }} axisLine={false} tickLine={false} />
+                <Tooltip content={<ChartTooltip />} />
                 <Legend wrapperStyle={{ fontSize: 12 }} />
-                <Area type="monotone" dataKey="couverture" name="Couverture" stroke="#1565c0" fill="url(#coverageFill)" strokeWidth={2} />
-                <Area type="monotone" dataKey="geometrie" name="Geometrie" stroke="#42a5f5" fill="url(#geometryFill)" strokeWidth={2} />
-              </AreaChart>
+                <Bar dataKey="espace" name="Espace couvert (km2)" fill="#4a148c" radius={[4, 4, 0, 0]} />
+                <Bar dataKey="anciennete" name="Anciennete (jours)" fill="#8e24aa" radius={[4, 4, 0, 0]} />
+              </BarChart>
             </ResponsiveContainer>
           </div>
         </DashboardPanel>
       </div>
 
-      <div style={{ marginTop: 20 }}>
-        <DashboardPanel
-          title="Journal des actions"
-          subtitle={`${actionEvents.length} evenement(s) affiche(s)`}
-          icon={<AlertTriangle size={16} color="#ef6c00" />}
-        >
-          <div style={{ overflowX: 'auto' }}>
-            <table style={{ width: '100%', borderCollapse: 'collapse', minWidth: 640 }}>
-              <thead>
-                <tr style={{ background: '#f8faff' }}>
-                  {['Event', 'Action', 'Cible', 'Date'].map((header) => (
-                    <th
-                      key={header}
-                      style={{
-                        textAlign: 'left',
-                        padding: '10px 12px',
-                        borderBottom: '1px solid #e8ecf0',
-                        fontSize: 11,
-                        color: '#666',
-                        textTransform: 'uppercase',
-                        letterSpacing: 0.4,
-                      }}
-                    >
-                      {header}
-                    </th>
-                  ))}
-                </tr>
-              </thead>
-              <tbody>
-                {actionEvents.map((event, index) => (
-                  <tr key={event.id} style={{ background: index % 2 === 0 ? 'white' : '#fafcff' }}>
-                    <td style={{ padding: '11px 12px', borderBottom: '1px solid #f1f3f5', fontWeight: 700, color: '#1a237e' }}>{event.id}</td>
-                    <td style={{ padding: '11px 12px', borderBottom: '1px solid #f1f3f5', color: '#333', fontSize: 13 }}>
-                      <div style={{ fontWeight: 600 }}>{event.action}</div>
-                    </td>
-                    <td style={{ padding: '11px 12px', borderBottom: '1px solid #f1f3f5', color: '#555', fontSize: 13 }}>{event.target}</td>
-                    <td style={{ padding: '11px 12px', borderBottom: '1px solid #f1f3f5', color: '#888', fontSize: 12 }}>{event.date}</td>
-                  </tr>
-                ))}
-              </tbody>
-            </table>
-
-            {actionEvents.length === 0 ? (
-              <div
-                style={{
-                  padding: '18px 12px',
-                  textAlign: 'center',
-                  color: '#888',
-                  fontSize: 13,
-                }}
-              >
-                Aucun evenement ne correspond aux filtres.
-              </div>
-            ) : null}
-          </div>
-        </DashboardPanel>
-      </div>
-
       <div style={{ marginTop: 14, fontSize: 12, color: '#888' }}>
-        Donnees live backend: liste utilisateurs (admins filtres), etat actif/inactif, couverture geometrique et journal derive.
+        Donnees live backend: utilisateurs, admins et tickets globaux.
       </div>
     </div>
   );
